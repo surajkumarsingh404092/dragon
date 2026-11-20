@@ -1,0 +1,6056 @@
+// DRAGON: all the editor's JavaScript in one file.
+// Part 1 (between CRDT-CORE-START and CRDT-CORE-END) is the sync engine: TextSeq, Doc, UndoManager.
+// Part 2 is the editor itself; the collaboration code is the section "H9: real-time collaboration".
+// ===== CRDT-CORE-START =====
+// DragonCRDT: the sync engine behind DRAGON's multiplayer editing.
+//
+// Three small pieces, all plain JavaScript with no libraries:
+//   1. TextSeq     – one file's text as a sequence CRDT (RGA). Every character has a
+//                    permanent ID, so edits from different people can be merged in any
+//                    order and every copy ends up with exactly the same text.
+//   2. Doc         – the whole project: one TextSeq per file plus a small
+//                    last-writer-wins registry (file name, deleted flag, folders, images).
+//                    It keeps a log of operations and a "state vector" so two copies can
+//                    work out exactly which operations the other one is missing.
+//   3. UndoManager – per-user undo/redo. It only ever reverts operations that THIS user
+//                    made, even if teammates edited the same file in between.
+//
+// The same file runs in the browser (window.DragonCRDT) and in Node (require) so the
+// fuzz test in test/fuzz.js checks the exact code that ships in index.html.
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  else root.DragonCRDT = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+
+  const HEAD = '^';            // ID of the invisible item that sits before the first character
+  const FOLDERS = '__folders'; // registry entry that stores explicitly created (empty) folders
+  const USERS = '__users';     // registry entry: client ID -> {name, color} (for "who wrote this")
+  const HISTORY = '__history'; // registry entry: checkpoint ID -> {name, at, by, sv}
+
+  // Total order on timestamps: higher Lamport clock wins, client ID breaks ties.
+  function greater(aLam, aClient, bLam, bClient) {
+    return aLam > bLam || (aLam === bLam && aClient > bClient);
+  }
+  // How many sequence numbers an operation uses. An insert of N characters gives each
+  // character its own ID (client:seq), so it uses N numbers. Deletes and sets use one.
+  function opSpan(op) { return op.k === 'ins' ? op.x.length : 1; }
+  function itemId(client, seq) { return client + ':' + seq; }
+  function splitId(id) { const at = id.lastIndexOf(':'); return [id.slice(0, at), Number(id.slice(at + 1))]; }
+
+  // Store lists of character IDs compactly: [[client, firstSeq, count], ...].
+  function compressIds(ids) {
+    const out = [];
+    for (const id of ids) {
+      const [c, s] = splitId(id);
+      const last = out[out.length - 1];
+      if (last && last[0] === c && last[1] + last[2] === s) last[2]++;
+      else out.push([c, s, 1]);
+    }
+    return out;
+  }
+  function expandIds(ranges) {
+    const out = [];
+    for (const [c, s, n] of ranges || []) for (let i = 0; i < n; i++) out.push(itemId(c, s + i));
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------
+  // TextSeq: Replicated Growable Array (RGA) with tombstones.
+  // Characters live in a doubly linked list. Each one remembers the character it was
+  // typed after (its "origin"). Deleted characters stay in the list as invisible
+  // tombstones so later operations can still refer to them.
+  // ---------------------------------------------------------------------------
+  class TextSeq {
+    constructor() {
+      this.head = { id: HEAD, lam: -1, client: '', ch: '', deleted: true, prev: null, next: null };
+      this.items = new Map([[HEAD, this.head]]);
+      this.length = 0;     // number of visible characters
+      this.maxLam = -1;    // newest content change (fallback for old delete operations)
+      this.seen = Object.create(null); // client -> last seq of its edits to this file
+      this._text = '';
+      this._dirty = false;
+    }
+
+    // RGA insert rule: start right after the origin and skip every item whose timestamp
+    // is greater than ours. Those are inserts made concurrently at the same spot (or text
+    // typed after them), and the newer one always goes first. Because every replica uses
+    // the same rule, every replica puts the character in the same place.
+    insertAfter(originId, id, lam, client, ch) {
+      let left = this.items.get(originId);
+      let right = left.next;
+      while (right && greater(right.lam, right.client, lam, client)) { left = right; right = right.next; }
+      const item = { id, lam, client, ch, deleted: false, prev: left, next: right };
+      left.next = item;
+      if (right) right.prev = item;
+      this.items.set(id, item);
+      this.length++;
+      this._dirty = true;
+      if (lam > this.maxLam) this.maxLam = lam;
+      return item;
+    }
+
+    remove(id, lam) {
+      const it = this.items.get(id);
+      if (it && !it.deleted) { it.deleted = true; this.length--; this._dirty = true; }
+      if (lam > this.maxLam) this.maxLam = lam;
+    }
+
+    text() {
+      if (this._dirty) {
+        const parts = [];
+        for (let it = this.head.next; it; it = it.next) if (!it.deleted) parts.push(it.ch);
+        this._text = parts.join('');
+        this._dirty = false;
+      }
+      return this._text;
+    }
+
+    // ID of the visible character just before caret position `index` (HEAD for 0).
+    // This is a "relative position": it stays correct when other people edit around it.
+    idBefore(index) {
+      if (index <= 0) return HEAD;
+      let n = 0, lastVisible = HEAD;
+      for (let it = this.head.next; it; it = it.next) {
+        if (it.deleted) continue;
+        n++; lastVisible = it.id;
+        if (n === index) return it.id;
+      }
+      return lastVisible;
+    }
+
+    // IDs of `count` visible characters starting at visible position `from`.
+    visibleIds(from, count) {
+      const out = [];
+      let n = 0;
+      for (let it = this.head.next; it && out.length < count; it = it.next) {
+        if (it.deleted) continue;
+        if (n >= from) out.push(it.id);
+        n++;
+      }
+      return out;
+    }
+
+    // Caret index for a relative position (the ID of the character to the caret's left).
+    // Works even if that character was deleted since. Returns null for unknown IDs.
+    indexOf(id) {
+      if (id === HEAD) return 0;
+      if (!this.items.has(id)) return null;
+      let n = 0;
+      for (let it = this.head.next; it; it = it.next) {
+        if (!it.deleted) n++;
+        if (it.id === id) return n;
+      }
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Doc: the shared project.
+  // Operation formats (all plain JSON, sent over the network and saved in IndexedDB):
+  //   insert  {k:'ins', f:fileId, c:client, s:seq, lam, o:originId, x:'text'}
+  //   delete  {k:'del', f:fileId, c, s, lam, d:[[client, seq, count], ...]}
+  //   set     {k:'set', f:fileId, c, s, lam, key:'name'|'deleted'|'data'|'type', v:value}
+  //           a file delete also carries seen:{client: seq}, the edits its author had seen
+  // ---------------------------------------------------------------------------
+  class Doc {
+    constructor(client) {
+      this.client = client;
+      this.seq = 0;                      // last sequence number this client used
+      this.lam = 0;                      // Lamport clock (max timestamp seen so far)
+      this.sv = Object.create(null);     // state vector: client -> last seq integrated
+      this.log = [];                     // every integrated operation, in causal order
+      this.pending = [];                 // operations waiting for something they depend on
+      this.seqs = new Map();             // fileId -> TextSeq
+      this.reg = new Map();              // fileId -> Map(key -> {v, lam, c})
+      this.handlers = [];
+    }
+
+    onChange(fn) { this.handlers.push(fn); }
+    _emit(ops, origin) { for (const fn of this.handlers) fn(ops, origin); }
+    _seq(fid) {
+      let s = this.seqs.get(fid);
+      if (!s) { s = new TextSeq(); this.seqs.set(fid, s); }
+      return s;
+    }
+
+    hasOp(op) { return op.s + opSpan(op) - 1 <= (this.sv[op.c] || 0); }
+
+    // An operation can be applied once (1) it is the next one from its author and
+    // (2) every character it refers to has arrived.
+    _ready(op) {
+      if (op.s !== (this.sv[op.c] || 0) + 1) return false;
+      if (op.k === 'ins') return this._seq(op.f).items.has(op.o);
+      if (op.k === 'del') {
+        const s = this._seq(op.f);
+        for (const id of expandIds(op.d)) if (!s.items.has(id)) return false;
+      }
+      return true;
+    }
+
+    _integrate(op) {
+      if (op.k === 'ins' || op.k === 'del') {
+        const seen = this._seq(op.f).seen;
+        const top = op.s + opSpan(op) - 1;
+        if (top > (seen[op.c] || 0)) seen[op.c] = top;
+      }
+      if (op.k === 'ins') {
+        const s = this._seq(op.f);
+        let origin = op.o;
+        // Each character is typed "after" the previous one, so a run of typing stays together.
+        for (let j = 0; j < op.x.length; j++) {
+          const id = itemId(op.c, op.s + j);
+          s.insertAfter(origin, id, op.lam + j, op.c, op.x[j]);
+          origin = id;
+        }
+      } else if (op.k === 'del') {
+        const s = this._seq(op.f);
+        for (const id of expandIds(op.d)) s.remove(id, op.lam);
+      } else if (op.k === 'set') {
+        let r = this.reg.get(op.f);
+        if (!r) { r = new Map(); this.reg.set(op.f, r); }
+        const cur = r.get(op.key);
+        // Last writer wins: the value with the greater timestamp is kept everywhere.
+        if (!cur || greater(op.lam, op.c, cur.lam, cur.c)) r.set(op.key, { v: op.v, lam: op.lam, c: op.c, seen: op.seen });
+      }
+      this.sv[op.c] = op.s + opSpan(op) - 1;
+      const top = op.lam + opSpan(op) - 1;
+      if (top > this.lam) this.lam = top;
+      this.log.push(op);
+    }
+
+    // Apply operations received from someone else (any order, duplicates are fine).
+    apply(ops, origin = 'remote') {
+      const done = [];
+      for (const op of ops) {
+        if (this.hasOp(op)) continue;
+        if (this._ready(op)) { this._integrate(op); done.push(op); }
+        else this.pending.push(op);
+      }
+      let progress = done.length > 0;
+      while (progress && this.pending.length) {
+        progress = false;
+        const still = [];
+        for (const op of this.pending) {
+          if (this.hasOp(op)) continue;
+          if (this._ready(op)) { this._integrate(op); done.push(op); progress = true; }
+          else still.push(op);
+        }
+        this.pending = still;
+      }
+      if (done.length) this._emit(done, origin);
+      return done;
+    }
+
+    // Create, apply and announce an operation made on this replica.
+    _local(op) {
+      op.c = this.client;
+      op.s = this.seq + 1;
+      op.lam = this.lam + 1;
+      this.seq += opSpan(op);
+      this._integrate(op);
+      this._emit([op], 'local');
+      return op;
+    }
+
+    insert(fid, index, text) {
+      if (!text) return null;
+      return this._local({ k: 'ins', f: fid, o: this._seq(fid).idBefore(index), x: text });
+    }
+    insertAfterId(fid, originId, text) {
+      if (!text) return null;
+      return this._local({ k: 'ins', f: fid, o: originId, x: text });
+    }
+    delete(fid, index, count) {
+      if (count <= 0) return null;
+      const ids = this._seq(fid).visibleIds(index, count);
+      return ids.length ? this._local({ k: 'del', f: fid, d: compressIds(ids) }) : null;
+    }
+    deleteIds(fid, ids) {
+      return ids.length ? this._local({ k: 'del', f: fid, d: compressIds(ids) }) : null;
+    }
+    set(fid, key, v) { return this._local({ k: 'set', f: fid, key, v }); }
+    // Deleting a file records which edits we had seen, so edits we had NOT seen
+    // (made at the same time, or offline) can bring the file back.
+    deleteFile(fid) {
+      const seen = Object.assign({}, this._seq(fid).seen);
+      return this._local({ k: 'set', f: fid, key: 'deleted', v: true, seen });
+    }
+
+    text(fid) { const s = this.seqs.get(fid); return s ? s.text() : ''; }
+    entry(fid, key) { const r = this.reg.get(fid); return r ? r.get(key) : undefined; }
+    get(fid, key) { const e = this.entry(fid, key); return e ? e.v : undefined; }
+
+    // A file is shown if it has a name and is not deleted. If someone made an edit the
+    // deleter had not seen (at the same time, or while offline), the edit wins and the
+    // file comes back, so nobody's work silently disappears.
+    isVisible(fid) {
+      if (fid.startsWith('__') || !this.get(fid, 'name')) return false;
+      const del = this.entry(fid, 'deleted');
+      if (!del || !del.v) return true;
+      const s = this.seqs.get(fid);
+      if (!s) return false;
+      if (!del.seen) return s.maxLam > del.lam;
+      for (const c in s.seen) if (s.seen[c] > (del.seen[c] || 0)) return true;
+      return false;
+    }
+    wasRestored(fid) {
+      const del = this.entry(fid, 'deleted');
+      return !!(del && del.v && this.isVisible(fid));
+    }
+    fileIds() { return Array.from(this.reg.keys()).filter(fid => this.isVisible(fid)); }
+    folders() {
+      const r = this.reg.get(FOLDERS);
+      return r ? Array.from(r.entries()).filter(([, e]) => e.v).map(([path]) => path) : [];
+    }
+
+    // Read-only copy of the project exactly as it was at state vector `sv`
+    // (used by version history). Operations are atomic, so each is either in or out.
+    snapshotAt(sv) {
+      const view = new Doc('~view');
+      view.apply(this.log.filter(op => op.s + opSpan(op) - 1 <= (sv[op.c] || 0)));
+      return view;
+    }
+
+    // For each line of a file: the client who typed most of its characters
+    // (used by "Who wrote this line?").
+    lineAuthors(fid) {
+      const s = this.seqs.get(fid);
+      const lines = [];
+      let counts = new Map();
+      const finish = () => {
+        let best = null, max = 0;
+        for (const [c, n] of counts) if (n > max) { max = n; best = c; }
+        lines.push(best);
+        counts = new Map();
+      };
+      if (s) {
+        for (let it = s.head.next; it; it = it.next) {
+          if (it.deleted) continue;
+          if (it.ch === '\n') { finish(); continue; }
+          counts.set(it.client, (counts.get(it.client) || 0) + 1);
+        }
+      }
+      finish();
+      return lines;
+    }
+
+    relAt(fid, index) { return this._seq(fid).idBefore(index); }
+    indexAt(fid, rel) { return this._seq(fid).indexOf(rel); }
+
+    // Everything the other side does not have yet, judged by its state vector.
+    opsMissing(remoteSv) {
+      remoteSv = remoteSv || {};
+      return this.log.filter(op => op.s + opSpan(op) - 1 > (remoteSv[op.c] || 0));
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // UndoManager: per-user, per-file undo and redo.
+  // A step remembers which character IDs this user inserted and deleted. Undo deletes
+  // the inserted ones and re-inserts copies of the deleted ones right where they were.
+  // Teammates' operations are never recorded here, so they are never undone.
+  // ---------------------------------------------------------------------------
+  class UndoManager {
+    constructor(doc, opts = {}) {
+      this.doc = doc;
+      this.captureTimeout = opts.captureTimeout == null ? 500 : opts.captureTimeout;
+      this.stacks = new Map();
+      this.lastFid = null;
+      this.lastTime = 0;
+      this.breakNext = false;
+    }
+    _st(fid) {
+      let s = this.stacks.get(fid);
+      if (!s) { s = { undo: [], redo: [] }; this.stacks.set(fid, s); }
+      return s;
+    }
+    // Record a local typing operation. Edits less than captureTimeout ms apart are grouped
+    // into one undo step, like in VS Code.
+    track(op, now = Date.now()) {
+      if (!op || (op.k !== 'ins' && op.k !== 'del')) return;
+      const st = this._st(op.f);
+      const ins = op.k === 'ins' ? [[op.c, op.s, op.x.length]] : [];
+      const del = op.k === 'del' ? op.d.map(r => r.slice()) : [];
+      const top = st.undo[st.undo.length - 1];
+      if (top && !this.breakNext && this.lastFid === op.f && now - this.lastTime < this.captureTimeout) {
+        top.ins.push(...ins); top.del.push(...del);
+      } else {
+        st.undo.push({ ins, del });
+      }
+      this.breakNext = false;
+      this.lastFid = op.f;
+      this.lastTime = now;
+      st.redo.length = 0;
+    }
+    stopCapturing() { this.breakNext = true; }
+    // Undo history is plain data (character IDs), so it can be saved and loaded.
+    // That lets Ctrl+Z keep working after a page reload.
+    toJSON(maxSteps = 100) {
+      const out = {};
+      for (const [fid, st] of this.stacks) out[fid] = { undo: st.undo.slice(-maxSteps), redo: st.redo.slice(-maxSteps) };
+      return out;
+    }
+    load(data) {
+      for (const fid of Object.keys(data || {})) {
+        const st = data[fid];
+        if (st && Array.isArray(st.undo) && Array.isArray(st.redo)) this.stacks.set(fid, { undo: st.undo, redo: st.redo });
+      }
+      this.breakNext = true;
+    }
+    canUndo(fid) { return this._st(fid).undo.length > 0; }
+    canRedo(fid) { return this._st(fid).redo.length > 0; }
+    undo(fid) { return this._pop(fid, 'undo', 'redo'); }
+    redo(fid) { return this._pop(fid, 'redo', 'undo'); }
+
+    // Returns the caret index after the change, or null if there was nothing to undo.
+    _pop(fid, from, to) {
+      const st = this._st(fid);
+      while (st[from].length) {
+        const step = st[from].pop();
+        const res = this._invert(fid, step);
+        if (res) { st[to].push(res.step); this.breakNext = true; return res.caret; }
+        // That step no longer changes anything (teammates removed it all): try the next one.
+      }
+      return null;
+    }
+
+    _invert(fid, step) {
+      const doc = this.doc;
+      const s = doc._seq(fid);
+      const insSet = new Set(expandIds(step.ins));
+      // Text inserted and deleted within the same step should simply stay gone.
+      const delSet = new Set(expandIds(step.del).filter(id => !insSet.has(id)));
+      const toDelete = [];
+      const groups = [];
+      let group = null;
+      for (let prev = s.head, it = s.head.next; it; prev = it, it = it.next) {
+        if (insSet.has(it.id) && !it.deleted) toDelete.push(it.id);
+        if (delSet.has(it.id) && it.deleted) {
+          if (!group) { group = { origin: prev.id, text: '' }; groups.push(group); }
+          group.text += it.ch;
+        } else {
+          group = null;
+        }
+      }
+      if (!toDelete.length && !groups.length) return null;
+
+      const inverse = { ins: [], del: [] };
+      let caret = null;
+      if (toDelete.length) {
+        const op = doc.deleteIds(fid, toDelete);
+        inverse.del.push(...op.d);
+        caret = s.indexOf(toDelete[0]);
+      }
+      for (const g of groups) {
+        const op = doc.insertAfterId(fid, g.origin, g.text);
+        inverse.ins.push([op.c, op.s, g.text.length]);
+        caret = s.indexOf(itemId(op.c, op.s + g.text.length - 1));
+      }
+      return { step: inverse, caret };
+    }
+  }
+
+  return { Doc, TextSeq, UndoManager, HEAD, FOLDERS, USERS, HISTORY, opSpan, compressIds, expandIds };
+});
+// ===== CRDT-CORE-END =====
+
+(() => {
+  // Background theme first, so the page does not flash the default look.
+  const THEMES = [
+    ['classic', 'Classic'], ['midnight', 'Midnight'], ['ocean', 'Ocean'], ['aurora', 'Aurora'],
+    ['ember', 'Ember'], ['forest', 'Forest'], ['sunset', 'Sunset'], ['graphite', 'Graphite']
+  ];
+  function applyTheme(theme) {
+    const id = THEMES.some(([t]) => t === theme) ? theme : 'classic';
+    document.documentElement.dataset.theme = id;
+    return id;
+  }
+  let currentTheme = 'classic';
+  try { currentTheme = applyTheme(localStorage.getItem('dragonTheme')); } catch (e) { applyTheme('classic'); }
+  const editor = document.getElementById('code');
+  const highlight = document.getElementById('highlight');
+  const lines = document.getElementById('lines');
+  const preview = document.getElementById('preview');
+  const status = document.getElementById('status');
+  const mediaMap = new Map(); // inserted media assets by file name
+  const projectFiles = new Map(); // normalized project path -> { content, dataUrl, blob, type, handle }
+  const projectFolders = new Set(['']);
+  const openTabs = [];
+  const collapsedFolders = new Set();
+  let activePath = 'index.html';
+  let projectDirectoryHandle = null;
+  let selectedTreePath = 'index.html';
+
+  // ---------- H9: shared project document ----------
+  // The project lives in a CRDT document (DragonCRDT, above). `projectFiles` is now a
+  // read-only view rebuilt from it, so the rest of the editor keeps working unchanged.
+  // Files are identified by a permanent file ID; the path is just a renameable field.
+  const COLLAB_PARAMS = new URLSearchParams(location.search);
+  // Every shared project has a stable room link: ?room=<id>. Opening the bare address goes
+  // back to the last project used in this browser, or starts a new one with a fresh ID.
+  // The room is always written into the address bar, so a refresh (even offline), a
+  // bookmark or a copied link all land in the same project. Nobody "owns" a room: the
+  // server only relays, so it keeps working when whoever created it closes their tab.
+  const collabRoom = (() => {
+    const clean = value => String(value || '').replace(/[^\w-]/g, '').slice(0, 40);
+    let room = clean(COLLAB_PARAMS.get('room'));
+    if (!room) {
+      try { room = clean(localStorage.getItem('dragonLastRoom')); } catch (e) {}
+      if (!room) {
+        let usedMain = false;   // browsers that used the old default room keep their work
+        try { usedMain = localStorage.getItem('dragonSv:main') !== null; } catch (e) {}
+        room = usedMain ? 'main' : 'p-' + Math.random().toString(36).slice(2, 10);
+      }
+    }
+    try { localStorage.setItem('dragonLastRoom', room); } catch (e) {}
+    if (COLLAB_PARAMS.get('room') !== room && /^https?:$/.test(location.protocol)) {
+      try { const url = new URL(location.href); url.searchParams.set('room', room); history.replaceState(history.state, '', url); } catch (e) {}
+    }
+    return room;
+  })();
+  const collabClient = Math.random().toString(36).slice(2, 10); // a fresh ID for every page load
+  const crdt = new DragonCRDT.Doc(collabClient);
+  const undoMgr = new DragonCRDT.UndoManager(crdt, { captureTimeout: 500 });
+  const fidToPath = new Map();
+  const pathToFid = new Map();
+  const localHandles = new Map();   // fileId -> FileSystemFileHandle (this computer only)
+  const localBlobs = new Map();     // fileId -> File/Blob (this computer only)
+  const localData = new Map();      // fileId -> data URL too large to sync
+  const MAX_SYNCED_DATA_URL = 1500000;
+  let editorFid = null;             // file whose text is currently in the textarea
+  const collabPeers = new Map();    // teammates: client -> { state, via, t }
+  let authorsOn = false;            // "Who wrote this" gutter is showing
+  let fileCounter = 0;
+  const newFileId = () => 'f' + collabClient + (++fileCounter).toString(36) + Date.now().toString(36).slice(-4);
+  function escapeHTML(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function highlightCode(source) {
+    const mode = modeOfPath(activePath);
+    const diagnostics = findModeDiagnostics(source, mode);
+    const patterns = {
+      html: /(<\!--[\s\S]*?(?:-->|$)|\/\*[\s\S]*?\*\/|\/\/[^\n]*|<!DOCTYPE\b[^>]*>|<\/?[A-Za-z][\w:-]*|\/?>|&(?:#\d+|#x[\da-f]+|[a-z][\w]+);|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b[A-Za-z_:][\w:.-]*(?=\s*=)|\b[-A-Za-z_][\w-]*(?=\s*:)|\b(?:const|let|var|function|return|if|else|for|while|new|class|async|await|true|false|null|undefined|console|window|document|this|import|export)\b|\b\d+(?:\.\d+)?\b|=)/gi,
+      css: /(\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|#[0-9a-fA-F]{3,8}\b|@[\w-]+|\b(?:\d*\.)?\d+(?:px|rem|em|vh|vw|%|s|ms|deg|fr)?\b|\b[-a-zA-Z_][\w-]*(?=\s*:)|[{}:;,()]|!important\b)/gi,
+      js: /(\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b(?:const|let|var|function|return|if|else|for|of|in|while|do|switch|case|break|continue|new|class|extends|async|await|try|catch|finally|throw|typeof|instanceof|delete|void|yield|import|export|from|default|true|false|null|undefined|this|super|static)\b|\b(?:console|window|document|Math|JSON|Array|String|Number|Object|Date|Promise|Set|Map|fetch)\b|\b\d+(?:\.\d+)?\b|===?|!==?|=>|\+\+|--|&&|\|\||\?\?|[{}()[\].,:;])/g,
+      typescript: /(\/\*[\s\S]*?\*\/|\/\/[^\n]*|`(?:\\.|[^`\\])*`|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b(?:abstract|any|as|asserts|async|await|bigint|boolean|break|case|catch|class|const|constructor|continue|debugger|declare|default|delete|do|else|enum|export|extends|false|finally|for|from|function|get|if|implements|import|in|infer|instanceof|interface|is|keyof|let|module|namespace|never|new|null|number|object|of|package|private|protected|public|readonly|require|return|set|static|string|super|switch|symbol|this|throw|true|try|type|typeof|undefined|unique|unknown|var|void|while|with|yield|satisfies|override)\b|\b(?:console|window|document|Math|JSON|Array|String|Number|Object|Date|Promise|Set|Map|Record|Partial|Readonly|Pick|Omit|RegExp|Error)\b|\b\d+(?:\.\d+)?n?\b|===?|!==?|=>|\?\.|\?\?|\+\+|--|&&|\|\||[{}()[\].,:;])/g,
+      sql: /(\/\*[\s\S]*?\*\/|--[^\n]*|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\b(?:select|from|where|and|or|not|null|is|in|like|between|exists|as|distinct|all|join|inner|left|right|outer|cross|on|using|group|by|having|order|asc|desc|limit|offset|union|except|intersect|insert|into|values|update|set|delete|create|alter|drop|table|view|index|database|primary|key|foreign|references|unique|check|default|constraint|autoincrement|integer|int|real|numeric|text|varchar|char|blob|boolean|date|datetime|case|when|then|else|end|begin|commit|rollback|transaction|with|recursive|pragma|explain|if|replace|returning|cascade|collate|conflict|temp|temporary|trigger|foreign|notnull)\b|\b(?:count|sum|avg|min|max|coalesce|nullif|ifnull|lower|upper|length|substr|substring|round|abs|date|datetime|strftime|printf|typeof|random)\b|\b\d+(?:\.\d+)?\b|<=|>=|<>|!=|=|[+*\/%<>-]|[{}()[\].,:;])/gi,
+      python: /("{3}[\s\S]*?(?:"{3}|$)|'{3}[\s\S]*?(?:'{3}|$)|#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b(?:False|None|True|and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield)\b|\b(?:print|len|range|str|int|float|list|dict|tuple|set|open|super|self|type|input|enumerate|zip|map|filter|sum|min|max|abs|any|all|sorted|reversed|isinstance|issubclass|property)\b|\b\d+(?:\.\d+)?(?:j)?\b|==|!=|<=|>=|\*\*|\/\/|:=|->|[+\-*\/%=<>!&|^~]|[{}()\[\].,:;])/g,
+      java: /(\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|@[A-Za-z_]\w*|\b(?:abstract|assert|boolean|break|byte|case|catch|char|class|const|continue|default|do|double|else|enum|extends|final|finally|float|for|if|implements|import|instanceof|int|interface|long|native|new|package|private|protected|public|return|short|static|strictfp|super|switch|synchronized|this|throw|throws|transient|try|void|volatile|while|true|false|null|var|record|sealed|permits)\b|\b(?:System|String|Integer|Double|Boolean|Math|Arrays|List|Map|Set|Objects|Scanner|Collections|Optional|Exception|Thread)\b|\b\d+(?:\.\d+)?[fFdDlL]?\b|\+\+|--|==|!=|<=|>=|&&|\|\||->|::|[+\-*\/%=<>!&|^~]|[{}()\[\].,:;])/g,
+      c: /(\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|^\s*#\s*[A-Za-z_]\w*|\b(?:auto|break|case|char|const|continue|default|do|double|else|enum|extern|float|for|goto|if|inline|int|long|register|restrict|return|short|signed|sizeof|static|struct|switch|typedef|union|unsigned|void|volatile|while|_Bool|bool|true|false|nullptr)\b|\b(?:printf|scanf|fprintf|fscanf|puts|gets|malloc|calloc|realloc|free|strlen|strcpy|strcmp|memcpy|memset|printf_s|main)\b|\b\d+(?:\.\d+)?[uUlLfF]*\b|\+\+|--|==|!=|<=|>=|&&|\|\||->|[+\-*\/%=<>!&|^~]|[{}()\[\].,:;])/gm,
+      cpp: /(\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|^\s*#\s*[A-Za-z_]\w*|\b(?:alignas|alignof|and|asm|auto|bool|break|case|catch|char|class|const|constexpr|continue|decltype|default|delete|do|double|else|enum|explicit|export|extern|false|float|for|friend|goto|if|inline|int|long|namespace|new|noexcept|nullptr|operator|or|private|protected|public|register|reinterpret_cast|return|short|signed|sizeof|static|struct|switch|template|this|thread_local|throw|true|try|typedef|typeid|typename|union|unsigned|using|virtual|void|volatile|while|override|final)\b|\b(?:std|cout|cin|cerr|endl|string|vector|map|set|unordered_map|unique_ptr|shared_ptr|make_unique|make_shared|printf|scanf|main)\b|\b\d+(?:\.\d+)?[uUlLfF]*\b|\+\+|--|==|!=|<=|>=|&&|\|\||->|::|[+\-*\/%=<>!&|^~]|[{}()\[\].,:;])/gm,
+      csharp: /(\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\$"(?:\\.|[^"\\])*"|\b(?:abstract|as|base|bool|break|byte|case|catch|char|checked|class|const|continue|decimal|default|delegate|do|double|else|enum|event|explicit|extern|false|finally|fixed|float|for|foreach|goto|if|implicit|in|int|interface|internal|is|lock|long|namespace|new|null|object|operator|out|override|params|private|protected|public|readonly|ref|return|sbyte|sealed|short|sizeof|stackalloc|static|string|struct|switch|this|throw|true|try|typeof|uint|ulong|unchecked|unsafe|ushort|using|var|virtual|void|volatile|while|async|await|record|init|with)\b|\b(?:Console|String|Int32|Math|List|Dictionary|Task|DateTime|Enumerable|Exception)\b|\b\d+(?:\.\d+)?[fFdDmMuUlL]*\b|\+\+|--|==|!=|<=|>=|&&|\|\||=>|\?\?|\?\.|[+\-*\/%=<>!&|^~]|[{}()\[\].,:;])/g,
+      php: /(\/\*[\s\S]*?\*\/|\/\/[^\n]*|\#[^\n]*|<\?php\b|\?>|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\$[A-Za-z_]\w*|\b(?:abstract|and|array|as|break|callable|case|catch|class|clone|const|continue|declare|default|do|echo|else|elseif|empty|endfor|endforeach|endif|endswitch|endwhile|enum|eval|exit|extends|final|finally|fn|for|foreach|function|global|if|implements|include|include_once|instanceof|insteadof|interface|isset|list|match|namespace|new|or|print|private|protected|public|readonly|require|require_once|return|static|switch|throw|trait|try|unset|use|var|while|xor|yield|true|false|null|self|parent)\b|\b(?:strlen|count|array_map|array_filter|json_encode|json_decode|str_replace|preg_match|file_get_contents|header|date|mysqli|PDO)\b|\b\d+(?:\.\d+)?\b|===?|!==?|<=|>=|=>|->|::|\?\?|\.\.\.|[+\-*\/%=<>!&|^~]|[{}()\[\].,:;])/g,
+      ruby: /(=begin[\s\S]*?=end|\#[^\n]*|"{3}[\s\S]*?"{3}|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[@$][A-Za-z_]\w*|\b(?:BEGIN|END|alias|and|begin|break|case|class|def|defined|do|else|elsif|end|ensure|false|for|if|in|module|next|nil|not|or|redo|rescue|retry|return|self|super|then|true|undef|unless|until|when|while|yield)\b|\b(?:puts|print|p|gets|raise|attr_reader|attr_writer|attr_accessor|require|include|extend|lambda|proc|Array|Hash|String|Integer|Float|File|Dir|Time)\b|\b\d+(?:\.\d+)?\b|===?|!=|<=|>=|=>|&\.|\+\+|--|[+\-*\/%=<>!&|^~]|[{}()\[\].,:;])/g,
+      swift: /(\/\*[\s\S]*?\*\/|\/\/[^\n]*|"{3}[\s\S]*?"{3}|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|@[A-Za-z_]\w*|\b(?:associatedtype|class|deinit|enum|extension|fileprivate|func|import|init|inout|internal|let|open|operator|private|protocol|public|rethrows|static|struct|subscript|typealias|var|break|case|continue|default|defer|do|else|fallthrough|for|guard|if|in|repeat|return|throw|switch|where|while|as|Any|catch|false|is|nil|super|self|Self|throws|true|try|await|async|some|any)\b|\b(?:print|String|Int|Double|Float|Bool|Array|Dictionary|Set|Optional|URL|Date|Result|Error|fatalError|precondition)\b|\b\d+(?:\.\d+)?\b|\+\+|--|==|!=|<=|>=|&&|\|\||->|\?\?|\?\.|[+\-*\/%=<>!&|^~]|[{}()\[\].,:;])/g,
+      kotlin: /(\/\*[\s\S]*?\*\/|\/\/[^\n]*|"{3}[\s\S]*?"{3}|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|@[A-Za-z_]\w*|\b(?:as|break|class|continue|do|else|false|for|fun|if|in|interface|is|null|object|package|return|super|this|throw|true|try|typealias|typeof|val|var|when|while|by|catch|constructor|delegate|dynamic|field|file|finally|get|import|init|param|property|receiver|set|setparam|where|actual|abstract|annotation|companion|const|crossinline|data|enum|expect|external|final|infix|inline|inner|internal|lateinit|noinline|open|operator|out|override|private|protected|public|reified|sealed|suspend|tailrec|vararg|yield)\b|\b(?:println|print|String|Int|Long|Double|Float|Boolean|List|MutableList|Map|Set|Array|Pair|Triple|Exception|Result|runCatching)\b|\b\d+(?:\.\d+)?[fFL]?\b|\+\+|--|==|!=|<=|>=|&&|\|\||->|\?\?|\?\.|::|[+\-*\/%=<>!&|^~]|[{}()\[\].,:;])/g,
+      rust: /(\/\*[\s\S]*?\*\/|\/\/[^\n]*|r\#*"[\s\S]*?"\#*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b(?:as|async|await|break|const|continue|crate|dyn|else|enum|extern|false|fn|for|if|impl|in|let|loop|match|mod|move|mut|pub|ref|return|self|Self|static|struct|super|trait|true|type|unsafe|use|where|while|abstract|become|box|do|final|macro|override|priv|typeof|unsized|virtual|yield)\b|\b(?:println|print|format|String|str|Vec|vec|HashMap|HashSet|Option|Result|Some|None|Ok|Err|unwrap|expect|to_string|clone|drop|assert|assert_eq|panic)\b|\b\d+(?:\.\d+)?(?:u8|u16|u32|u64|u128|i8|i16|i32|i64|i128|f32|f64|usize|isize)?\b|\+\+|--|==|!=|<=|>=|&&|\|\||->|=>|::|\.\.|[+\-*\/%=<>!&|^~]|[{}()\[\].,:;])/g
+    };
+    const tokenPattern = patterns[mode] || /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b[A-Za-z_]\w*\b|\b\d+(?:\.\d+)?\b|[{}()[\].,:;])/g;
+    tokenPattern.lastIndex = 0;
+    let result = '';
+    let last = 0;
+    const keywords = new Set((languageKeywords[mode] || []).map(v => v.toLowerCase()));
+    const builtins = new Set((languageBuiltins[mode] || []).map(v => v.toLowerCase()));
+
+    function paintChunk(text, absoluteStart, baseClass) {
+      if (!text) return '';
+      const absoluteEnd = absoluteStart + text.length;
+      const overlapping = diagnostics.filter(d => d.start < absoluteEnd && d.end > absoluteStart)
+        .sort((a, b) => a.start - b.start);
+      if (!overlapping.length) {
+        const safe = escapeHTML(text);
+        return baseClass ? '<span class="' + baseClass + '">' + safe + '</span>' : safe;
+      }
+      let out = '';
+      let cursor = absoluteStart;
+      for (const d of overlapping) {
+        const errStart = Math.max(cursor, d.start, absoluteStart);
+        const errEnd = Math.min(d.end, absoluteEnd);
+        if (errStart > cursor) {
+          const part = escapeHTML(source.slice(cursor, errStart));
+          out += baseClass ? '<span class="' + baseClass + '">' + part + '</span>' : part;
+        }
+        if (errEnd > errStart) {
+          out += '<span class="t-error" title="' + escapeHTML(d.message) + '">' +
+                 escapeHTML(source.slice(errStart, errEnd)) + '</span>';
+          cursor = errEnd;
+        }
+      }
+      if (cursor < absoluteEnd) {
+        const part = escapeHTML(source.slice(cursor, absoluteEnd));
+        out += baseClass ? '<span class="' + baseClass + '">' + part + '</span>' : part;
+      }
+      return out;
+    }
+
+    let match;
+    while ((match = tokenPattern.exec(source)) !== null) {
+      result += paintChunk(source.slice(last, match.index), last, '');
+      const token = match[0];
+      const lower = token.toLowerCase();
+      let cls = 't-punct';
+      if (mode === 'html') {
+        if (token.startsWith('<!--') || token.startsWith('/*') || token.startsWith('//')) cls = 't-comment';
+        else if (/^<!DOCTYPE/i.test(token)) cls = 't-doctype';
+        else if (/^<\/?[A-Za-z]/.test(token)) cls = 't-tag';
+        else if (/^&/.test(token)) cls = 't-entity';
+        else if (/^["'`]/.test(token)) cls = 't-string';
+        else if (/^[A-Za-z_:][\w:.-]*$/.test(token) && /^\s*=/.test(source.slice(tokenPattern.lastIndex))) cls = 't-attr';
+        else if (/^(const|let|var|function|return|if|else|for|while|new|class|async|await|true|false|null|undefined|console|window|document|this|import|export)$/i.test(token)) cls = 't-js';
+        else if (/^\d/.test(token)) cls = 't-number';
+        else if (/^(color|background|background-color|font-family|font-size|font-weight|margin|padding|display|width|height|border|border-radius|text-align|gap|position|overflow|cursor|line-height|box-shadow|white-space|z-index)$/i.test(token)) cls = 't-css';
+      } else if (mode === 'css') {
+        if (token.startsWith('/*')) cls = 't-comment';
+        else if (/^["']/.test(token)) cls = 't-string';
+        else if (/^#/.test(token) || /^\d/.test(token)) cls = 't-number';
+        else if (/^@/.test(token) || /^(important)$/i.test(token.replace(/^!/, ''))) cls = 't-js';
+        else if (/^[-a-zA-Z_][\w-]*$/.test(token) && /^\s*:/.test(source.slice(tokenPattern.lastIndex))) cls = 't-css';
+        else if (/^[{}:;,()]$/.test(token)) cls = 't-punct';
+      } else {
+        const isComment = token.startsWith('/*') || token.startsWith('//') || (mode === 'sql' && token.startsWith('--')) ||
+          ((mode === 'python' || mode === 'ruby' || mode === 'php') && token.startsWith('#')) ||
+          (mode === 'ruby' && token.startsWith('=begin'));
+        const pythonTripleQuote = mode === 'python' && /^("{3}|'{3})/.test(token);
+        const tokenLineStart = source.lastIndexOf('\n', Math.max(0, match.index - 1)) + 1;
+        const standalonePythonTripleBlock = pythonTripleQuote && source.slice(tokenLineStart, match.index).trim() === '';
+        if (standalonePythonTripleBlock) cls = 't-python-triple-comment';
+        else if (isComment) cls = 't-comment';
+        else if (/^(<\?php|\?>|#\s*[A-Za-z_]\w*)/i.test(token)) cls = 't-preproc';
+        else if (/^("|'|`|"{3}|'{3})/.test(token)) cls = 't-string';
+        else if (/^\$[A-Za-z_]/.test(token) || /^[@$][A-Za-z_]/.test(token)) cls = 't-variable';
+        else if (/^\d/.test(token)) cls = 't-number';
+        else if (keywords.has(lower)) cls = 't-js';
+        else if (builtins.has(lower) || /^(system|console|std|math|json|array|string|number|object|date|promise|set|map|fetch|self|super)$/.test(lower)) cls = 't-css';
+        else if (/^#\s*[A-Za-z_]\w*/.test(token)) cls = 't-preproc';
+      }
+      result += paintChunk(token, match.index, cls);
+      last = tokenPattern.lastIndex;
+    }
+    result += paintChunk(source.slice(last), last, '');
+    return result + (source.endsWith('\n') ? '' : '\n');
+  }
+
+
+  // File-type-aware diagnostics: catch code pasted into the wrong language file.
+  // This is a lightweight editor check, not a replacement for VS Code's language servers.
+  function findModeDiagnostics(source, mode) {
+    if (mode === 'html') return findDiagnostics(source);
+    const issues = [];
+    // Keep offsets/newlines intact, but hide Python strings and comments from
+    // the editor's cross-language diagnostics (they are text, not executable code).
+    const scanSource = mode === 'python' ? maskPythonStringsAndComments(source) : source;
+    const addMatch = (regex, message, group = 0) => {
+      regex.lastIndex = 0;
+      let match;
+      while ((match = regex.exec(scanSource)) !== null) {
+        const token = match[group] || match[0];
+        const start = match.index + (group ? match[0].indexOf(token) : 0);
+        if (token.length) issues.push({ start, end: start + token.length, message });
+        if (!regex.global) break;
+        if (match[0].length === 0) regex.lastIndex++;
+      }
+    };
+
+    const nativeModes = ['python','java','c','cpp','csharp','php','ruby','swift','kotlin','rust','typescript','sql'];
+    if (mode !== 'php') {
+      addMatch(/<!DOCTYPE\b[^>]*>|<\/?(?:html|head|body|div|span|p|h[1-6]|script|style|section|main|header|footer|button|input|form|ul|ol|li|a|img|table|br|hr)\b[^>]*>/gi,
+        'HTML markup is not valid in a .' + extensionLabelForMode(mode) + ' file. Put markup in an .html file.');
+    }
+
+    if (mode === 'css') {
+      addMatch(/\b(?:const|let|var|function|return|console\.log|document\.getElementById|=>|async\s+function)\b/g,
+        'JavaScript code is not valid in a .css file. Move this code to a .js file.');
+      const stack = [];
+      let quote = '', comment = false, escaped = false;
+      for (let i = 0; i < source.length; i++) {
+        const ch = source[i], next = source[i + 1];
+        if (comment) { if (ch === '*' && next === '/') { comment = false; i++; } continue; }
+        if (quote) { if (escaped) escaped = false; else if (ch === '\\') escaped = true; else if (ch === quote) quote = ''; continue; }
+        if (ch === '/' && next === '*') { comment = true; i++; continue; }
+        if (ch === '"' || ch === "'") { quote = ch; continue; }
+        if (ch === '{') stack.push(i);
+        if (ch === '}' && stack.length) stack.pop();
+        else if (ch === '}' && !stack.length) issues.push({ start:i, end:i+1, message:'Unexpected closing brace in CSS.' });
+      }
+      for (const at of stack) issues.push({ start:at, end:at+1, message:'Missing closing } in CSS rule.' });
+      addMatch(/<\s*[A-Za-z][\w:-]*(?:\s[^<>]*)?>/g,
+        'HTML tags are not valid in a .css file. Put markup in an .html file.');
+    }
+
+    if (mode === 'js') {
+      addMatch(/(?:^|\n)\s*(?:[.#][A-Za-z_-][\w-]*|body|html|:root|\*|[A-Za-z][\w-]*)\s*\{(?=[\s\S]{0,300}?\b(?:color|background(?:-color)?|margin|padding|display|font-size|border|width|height)\s*:)/g,
+        'CSS rule syntax is not valid in a .js file. Move this code to a .css file.');
+      addMatch(/\b(?:color|background-color|margin|padding|font-size|font-weight|display|border-radius)\s*:\s*(?:#[\da-f]{3,8}\b|[A-Za-z]+|\d)/gi,
+        'This looks like a CSS declaration. Move it into a .css file or a JavaScript object where appropriate.');
+      checkBalancedCode(source, mode, issues);
+    }
+
+    if (nativeModes.includes(mode)) {
+      // Catch obvious CSS or browser-JavaScript pasted into a native-language file.
+      addMatch(/(?:^|\n)\s*(?:[.#][A-Za-z_-][\w-]*|body|html|:root|\*)\s*\{(?=[\s\S]{0,250}?\b(?:color|background(?:-color)?|margin|padding|display|font-size|border|width|height)\s*:)/gi,
+        'This looks like CSS, not ' + languageNameForMode(mode) + '. Move styling into a .css file.');
+      addMatch(mode === 'typescript' ? /\b(?:document\.getElementById|document\.querySelector|window\.addEventListener)\s*\(/g : /\b(?:document\.getElementById|document\.querySelector|window\.addEventListener|console\.log)\s*\(/g,
+        'This looks like browser JavaScript, not ' + languageNameForMode(mode) + '. Move it into a .js file.');
+      if (mode !== 'php') {
+        addMatch(/<\s*(?:!DOCTYPE|html|head|body|div|span|p|h[1-6]|script|style|section|main|button|input|form|ul|ol|li|a|img)\b[^>]*>/gi,
+          'HTML markup is in a ' + languageNameForMode(mode) + ' file. Move markup into an .html file.');
+      }
+      checkBalancedCode(source, mode, issues);
+      if (mode === 'python') {
+        addMatch(/\bconsole\.log\s*\(/g, 'console.log() is JavaScript. In Python use print().');
+        const lines = scanSource.split('\n');
+        let offset = 0;
+        for (const line of lines) {
+          const clean = line.replace(/\s+#.*$/, '').trim();
+          const m = clean.match(/^(?:if|elif|else|for|while|def|class|try|except|finally|with|match|case)\b/);
+          if (m && !clean.endsWith(':') && !/[\\([{,]$/.test(clean)) {
+            const keyStart = line.indexOf(m[0]);
+            issues.push({ start: offset + Math.max(0, keyStart), end: offset + Math.max(0, keyStart) + m[0].length, message:'Python block statements usually need a colon (:) at the end of the header.' });
+          }
+          offset += line.length + 1;
+        }
+      }
+      if (mode === 'rust') {
+        addMatch(/\blet\s+(?:mut\s+)?[A-Za-z_]\w*\s*=\s*[^;{}\n]+(?=\n|$)/g,
+          'Rust let bindings usually end with a semicolon (;). Check whether this statement is missing one.');
+      }
+    }
+    return issues.sort((a,b) => a.start - b.start);
+  }
+
+  function checkBalancedCode(source, mode, issues) {
+    const stack = [], pairs = { ')':'(', ']':'[', '}':'{' };
+    let quote = '', quoteAt = -1, triple = false, lineComment = false, blockComment = false, escaped = false;
+    const hashComments = ['python','ruby'].includes(mode) || mode === 'php';
+    const cLikeComments = !['python','ruby'].includes(mode);
+    for (let i = 0; i < source.length; i++) {
+      const ch = source[i], next = source[i + 1];
+      if (lineComment) { if (ch === '\n') lineComment = false; continue; }
+      if (blockComment) { if (ch === '*' && next === '/') { blockComment = false; i++; } continue; }
+      if (quote) {
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (triple && source.startsWith(quote.repeat(3), i)) { quote = ''; triple = false; i += 2; continue; }
+        if (!triple && ch === quote) { quote = ''; continue; }
+        if (!triple && ch === '\n' && !['swift','kotlin'].includes(mode)) {
+          issues.push({ start:quoteAt, end:quoteAt + 1, message:'String literal is not closed.' }); quote = ''; continue;
+        }
+        continue;
+      }
+      if (hashComments && ch === '#') { lineComment = true; continue; }
+      if (mode === 'ruby' && source.startsWith('=begin', i) && (i === 0 || source[i-1] === '\n')) { lineComment = true; continue; }
+      if (mode === 'sql' && ch === '-' && next === '-') { lineComment = true; i++; continue; }
+      if (cLikeComments && ch === '/' && next === '/') { lineComment = true; i++; continue; }
+      if (cLikeComments && ch === '/' && next === '*') { blockComment = true; i++; continue; }
+      if ((mode === 'python' || mode === 'ruby' || mode === 'swift' || mode === 'kotlin') && (source.startsWith('"'.repeat(3), i) || source.startsWith("'".repeat(3), i))) {
+        quote = source.slice(i, i + 3); quoteAt = i; triple = true; i += 2; continue;
+      }
+      if (ch === '"' || ch === "'") { quote = ch; quoteAt = i; continue; }
+      if ('([{'.includes(ch)) stack.push({ ch, at:i });
+      else if (pairs[ch]) {
+        if (stack.length && stack[stack.length - 1].ch === pairs[ch]) stack.pop();
+        else issues.push({ start:i, end:i+1, message:'Unexpected closing ' + ch + ' in ' + languageNameForMode(mode) + '.' });
+      }
+    }
+    // In Python, an unfinished triple-quoted block is common while the user is typing.
+    // Keep its opening delimiter in the normal multiline-block colour instead of marking it red;
+    // the Python runtime will still report a syntax error if the user runs incomplete code.
+    if (quote && !(mode === 'python' && triple)) {
+      issues.push({ start:quoteAt, end:Math.min(source.length, quoteAt + (triple ? 3 : 1)), message:'String literal is not closed.' });
+    }
+    if (blockComment) {
+      const at = source.lastIndexOf('/*');
+      if (at >= 0) issues.push({ start:at, end:at + 2, message:'Block comment is not closed with */.' });
+    }
+    for (const item of stack) issues.push({ start:item.at, end:item.at + 1, message:'Missing closing bracket for ' + item.ch + ' in ' + languageNameForMode(mode) + '.' });
+  }
+
+
+  function updateEditor() {
+    highlight.innerHTML = highlightCode(editor.value);
+    const count = Math.max(1, editor.value.split('\n').length);
+    lines.textContent = Array.from({length: count}, (_, i) => i + 1).join('\n');
+    if (authorsOn) renderAuthorGutter();
+    syncScroll();
+  }
+  function syncScroll() {
+    highlight.scrollTop = editor.scrollTop;
+    highlight.scrollLeft = editor.scrollLeft;
+    lines.scrollTop = editor.scrollTop;
+  }
+  // Find complete elements that use an unknown/misspelled HTML tag, such as
+  // <h1s>suraj</h1s>. Their whole element is removed from the preview, while
+  // the source remains visible in the editor with red error underlines.
+  function findInvalidElementRanges(source) {
+    const ranges = [];
+    const stack = [];
+
+    function tagEnd(start) {
+      let quote = '';
+      for (let i = start; i < source.length; i++) {
+        const ch = source[i];
+        if (quote) {
+          if (ch === quote) quote = '';
+        } else if (ch === '"' || ch === "'") {
+          quote = ch;
+        } else if (ch === '>') {
+          return i;
+        }
+      }
+      return -1;
+    }
+
+    let cursor = 0;
+    while (cursor < source.length) {
+      const lt = source.indexOf('<', cursor);
+      if (lt < 0) break;
+
+      if (source.startsWith('<\!--', lt)) {
+        const commentEnd = source.indexOf('-->', lt + 4);
+        cursor = commentEnd < 0 ? source.length : commentEnd + 3;
+        continue;
+      }
+      if (/^<!DOCTYPE\b/i.test(source.slice(lt)) || source.startsWith('<!', lt) || source.startsWith('<?', lt)) {
+        const specialEnd = source.indexOf('>', lt + 2);
+        cursor = specialEnd < 0 ? source.length : specialEnd + 1;
+        continue;
+      }
+
+      const opening = source.slice(lt).match(/^<\s*(\/)?\s*([A-Za-z][\w:-]*)\b/);
+      if (!opening) {
+        cursor = lt + 1;
+        continue;
+      }
+      const end = tagEnd(lt + opening[0].length);
+      if (end < 0) break; // incomplete tag while the user is typing
+
+      const closing = Boolean(opening[1]);
+      const name = opening[2].toLowerCase();
+      const unknown = !knownTags.has(name) && !name.includes('-');
+      const fullTag = source.slice(lt, end + 1);
+
+      if (closing) {
+        let stackIndex = -1;
+        for (let i = stack.length - 1; i >= 0; i--) {
+          if (stack[i].name === name) { stackIndex = i; break; }
+        }
+        if (stackIndex >= 0) {
+          const entry = stack[stackIndex];
+          if (entry.invalid) ranges.push({ start: entry.start, end: end + 1 });
+          stack.splice(stackIndex);
+        } else if (unknown) {
+          // An unmatched invalid closing tag is itself invalid markup.
+          ranges.push({ start: lt, end: end + 1 });
+        }
+      } else {
+        const invalid = unknown;
+        const selfClosing = /\/\s*>$/.test(fullTag);
+        if (invalid && (selfClosing || voidTags.has(name))) {
+          ranges.push({ start: lt, end: end + 1 });
+        } else if (!selfClosing && !voidTags.has(name)) {
+          stack.push({ name, start: lt, invalid });
+        }
+      }
+
+      cursor = end + 1;
+
+      // Ignore raw JavaScript/CSS source when searching for HTML tags.
+      if (!closing && (name === 'script' || name === 'style')) {
+        const closePattern = new RegExp('</\\s*' + name + '\\s*>', 'ig');
+        closePattern.lastIndex = cursor;
+        const match = closePattern.exec(source);
+        if (match) cursor = match.index;
+        else cursor = source.length;
+      }
+    }
+
+    // An invalid opening tag without a matching close should not leak its text
+    // into the preview. Remove from that opening tag to the end of the source.
+    for (const entry of stack) {
+      if (entry.invalid) ranges.push({ start: entry.start, end: source.length });
+    }
+
+    // Merge overlapping/nested removals before editing the source.
+    ranges.sort((a, b) => a.start - b.start || b.end - a.end);
+    const merged = [];
+    for (const range of ranges) {
+      const prev = merged[merged.length - 1];
+      if (prev && range.start <= prev.end) prev.end = Math.max(prev.end, range.end);
+      else merged.push({ ...range });
+    }
+    return merged;
+  }
+
+  // ---------- Multi-file project workspace ----------
+  function normalizeProjectPath(path) {
+    const parts = [];
+    String(path || '').replace(/\\/g, '/').replace(/^\/+/, '').split('/').forEach(part => {
+      if (!part || part === '.') return;
+      if (part === '..') parts.pop();
+      else parts.push(part);
+    });
+    return parts.join('/');
+  }
+
+  function parentPath(path) {
+    const clean = normalizeProjectPath(path);
+    const slash = clean.lastIndexOf('/');
+    return slash < 0 ? '' : clean.slice(0, slash);
+  }
+
+  function baseName(path) {
+    const clean = normalizeProjectPath(path);
+    return clean.slice(clean.lastIndexOf('/') + 1);
+  }
+
+  function extensionOf(path) {
+    const name = baseName(path);
+    const dot = name.lastIndexOf('.');
+    return dot < 0 ? '' : name.slice(dot + 1).toLowerCase();
+  }
+
+  function modeOfPath(path) {
+    const ext = extensionOf(path);
+    if (['html','htm','xml','svg'].includes(ext)) return 'html';
+    if (ext === 'css') return 'css';
+    if (['js','mjs','cjs','jsx'].includes(ext)) return 'js';
+    if (['ts','tsx','mts','cts'].includes(ext)) return 'typescript';
+    if (ext === 'sql') return 'sql';
+    if (ext === 'py') return 'python';
+    if (ext === 'java') return 'java';
+    if (['c','h'].includes(ext)) return 'c';
+    if (['cpp','cc','cxx','hpp','hxx','hh'].includes(ext)) return 'cpp';
+    if (ext === 'cs') return 'csharp';
+    if (ext === 'php') return 'php';
+    if (ext === 'rb') return 'ruby';
+    if (ext === 'swift') return 'swift';
+    if (['kt','kts'].includes(ext)) return 'kotlin';
+    if (ext === 'rs') return 'rust';
+    return 'text';
+  }
+  function languageNameForMode(mode) {
+    return ({html:'HTML',css:'CSS',js:'JavaScript',typescript:'TypeScript',sql:'SQL',python:'Python',java:'Java',c:'C',cpp:'C++',csharp:'C#',php:'PHP',ruby:'Ruby',swift:'Swift',kotlin:'Kotlin',rust:'Rust',text:'Text'})[mode] || mode;
+  }
+  function extensionLabelForMode(mode) {
+    return ({html:'html',css:'css',js:'js',typescript:'ts',sql:'sql',python:'py',java:'java',c:'c',cpp:'cpp',csharp:'cs',php:'php',ruby:'rb',swift:'swift',kotlin:'kt',rust:'rs'})[mode] || mode;
+  }
+  function isNativeLanguageMode(mode) {
+    return ['python','java','c','cpp','csharp','php','ruby','swift','kotlin','rust','typescript','sql'].includes(mode);
+  }
+  const languageKeywords = {
+    python: ['False','None','True','and','as','assert','async','await','break','class','continue','def','del','elif','else','except','finally','for','from','global','if','import','in','is','lambda','nonlocal','not','or','pass','raise','return','try','while','with','yield','print','self'],
+    java: ['abstract','assert','boolean','break','byte','case','catch','char','class','const','continue','default','do','double','else','enum','extends','final','finally','float','for','if','implements','import','instanceof','int','interface','long','native','new','package','private','protected','public','return','short','static','super','switch','synchronized','this','throw','throws','transient','try','void','volatile','while','var','record'],
+    c: ['auto','break','case','char','const','continue','default','do','double','else','enum','extern','float','for','goto','if','inline','int','long','register','return','short','signed','sizeof','static','struct','switch','typedef','union','unsigned','void','volatile','while','bool','true','false'],
+    cpp: ['alignas','alignof','and','asm','auto','bool','break','case','catch','char','class','const','constexpr','continue','decltype','default','delete','do','double','else','enum','explicit','export','extern','false','float','for','friend','goto','if','inline','int','long','namespace','new','noexcept','nullptr','operator','or','private','protected','public','return','short','signed','sizeof','static','struct','switch','template','this','throw','true','try','typedef','typename','union','unsigned','using','virtual','void','volatile','while'],
+    csharp: ['abstract','as','base','bool','break','byte','case','catch','char','checked','class','const','continue','decimal','default','delegate','do','double','else','enum','event','explicit','extern','false','finally','fixed','float','for','foreach','goto','if','implicit','in','int','interface','internal','is','lock','long','namespace','new','null','object','operator','out','override','params','private','protected','public','readonly','ref','return','sbyte','sealed','short','sizeof','stackalloc','static','string','struct','switch','this','throw','true','try','typeof','uint','ulong','unchecked','unsafe','ushort','using','var','virtual','void','volatile','while','async','await','record'],
+    php: ['abstract','and','array','as','break','callable','case','catch','class','clone','const','continue','declare','default','do','echo','else','elseif','empty','enum','extends','final','finally','fn','for','foreach','function','global','if','implements','include','instanceof','interface','isset','list','match','namespace','new','or','print','private','protected','public','readonly','require','return','static','switch','throw','trait','try','unset','use','var','while','yield','true','false','null','self','parent'],
+    ruby: ['alias','and','begin','break','case','class','def','defined','do','else','elsif','end','ensure','false','for','if','in','module','next','nil','not','or','redo','rescue','retry','return','self','super','then','true','undef','unless','until','when','while','yield','puts','print'],
+    swift: ['associatedtype','class','deinit','enum','extension','fileprivate','func','import','init','inout','internal','let','open','operator','private','protocol','public','rethrows','static','struct','subscript','typealias','var','break','case','continue','default','defer','do','else','fallthrough','for','guard','if','in','repeat','return','throw','switch','where','while','as','Any','catch','false','is','nil','super','self','Self','throws','true','try','await','async','some','any'],
+    kotlin: ['as','break','class','continue','do','else','false','for','fun','if','in','interface','is','null','object','package','return','super','this','throw','true','try','typealias','val','var','when','while','by','catch','constructor','finally','import','init','override','private','protected','public','internal','sealed','suspend','data','enum','companion','lateinit','open','abstract'],
+    rust: ['as','async','await','break','const','continue','crate','dyn','else','enum','extern','false','fn','for','if','impl','in','let','loop','match','mod','move','mut','pub','ref','return','self','Self','static','struct','super','trait','true','type','unsafe','use','where','while'],
+    js: ['async','await','break','case','catch','class','const','continue','default','delete','do','else','export','extends','false','finally','for','from','function','if','import','in','instanceof','let','new','null','of','return','static','super','switch','this','throw','true','try','typeof','var','void','while','yield'],
+    typescript: ['abstract','any','as','asserts','async','await','bigint','boolean','break','case','catch','class','const','constructor','continue','declare','default','delete','do','else','enum','export','extends','false','finally','for','from','function','if','implements','import','in','infer','instanceof','interface','is','keyof','let','module','namespace','never','new','null','number','object','of','package','private','protected','public','readonly','return','set','static','string','super','switch','symbol','this','throw','true','try','type','typeof','undefined','unique','unknown','var','void','while','with','yield','satisfies','override'],
+    sql: ['select','from','where','and','or','not','null','is','in','like','between','exists','as','distinct','all','join','inner','left','right','outer','cross','on','using','group','by','having','order','asc','desc','limit','offset','union','except','intersect','insert','into','values','update','set','delete','create','alter','drop','table','view','index','primary','key','foreign','references','unique','check','default','constraint','autoincrement','integer','int','real','numeric','text','varchar','char','blob','boolean','date','datetime','case','when','then','else','end','begin','commit','rollback','transaction','with','recursive','pragma','explain','if','replace','returning','cascade','collate','conflict','temp','temporary','trigger']
+  };
+  const languageBuiltins = {
+    python: ['print','len','range','str','int','float','list','dict','tuple','set','open','super','input','enumerate','zip','map','filter','sum','min','max','abs','any','all','sorted','isinstance'],
+    java: ['System','String','Integer','Double','Boolean','Math','Arrays','List','Map','Set','Objects','Scanner','Collections','Optional','Exception','Thread'],
+    c: ['printf','scanf','fprintf','fscanf','puts','gets','malloc','calloc','realloc','free','strlen','strcpy','strcmp','memcpy','memset','main'],
+    cpp: ['std','cout','cin','cerr','endl','string','vector','map','set','unordered_map','unique_ptr','shared_ptr','make_unique','make_shared','printf','scanf','main'],
+    csharp: ['Console','String','Int32','Math','List','Dictionary','Task','DateTime','Enumerable','Exception'],
+    php: ['strlen','count','array_map','array_filter','json_encode','json_decode','str_replace','preg_match','file_get_contents','header','date','mysqli','PDO'],
+    ruby: ['puts','print','p','gets','raise','attr_reader','attr_writer','attr_accessor','require','include','extend','lambda','proc','Array','Hash','String','Integer','Float','File','Dir','Time'],
+    swift: ['print','String','Int','Double','Float','Bool','Array','Dictionary','Set','Optional','URL','Date','Result','Error','fatalError','precondition'],
+    kotlin: ['println','print','String','Int','Long','Double','Float','Boolean','List','MutableList','Map','Set','Array','Pair','Triple','Exception','Result','runCatching'],
+    rust: ['println','print','format','String','str','Vec','vec','HashMap','HashSet','Option','Result','Some','None','Ok','Err','unwrap','expect','to_string','clone','drop','assert','assert_eq','panic'],
+    typescript: ['console','log','error','warn','String','Number','Boolean','Array','Promise','Map','Set','Date','Math','JSON','RegExp','Error','Record','Partial','Readonly','Pick','Omit','parseInt','parseFloat','isNaN'],
+    sql: ['count','sum','avg','min','max','coalesce','nullif','ifnull','lower','upper','length','substr','substring','round','abs','date','datetime','strftime','printf','typeof','random']
+  };
+  const languageSnippets = {
+    python: [
+      {label:'print',detail:'Python print statement',insert:'print("Hello, world!")',cursorOffset:7},
+      {label:'def',detail:'Function definition',insert:'def function_name():\n    \n',cursorOffset:20},
+      {label:'if',detail:'If statement',insert:'if condition:\n    \n',cursorOffset:3},
+      {label:'for',detail:'For loop',insert:'for item in items:\n    \n',cursorOffset:4},
+      {label:'main',detail:'Main entry-point guard',insert:'if __name__ == "__main__":\n    main()\n',cursorOffset:34},
+      {label:'try',detail:'Try / except',insert:'try:\n    \nexcept Exception as error:\n    print(error)',cursorOffset:9}
+    ],
+    java: [
+      {label:'main',detail:'Java main method',insert:'public static void main(String[] args) {\n    \n}',cursorOffset:39},
+      {label:'sout',detail:'Print to console',insert:'System.out.println();',cursorOffset:19},
+      {label:'class',detail:'Class template',insert:'public class ClassName {\n    \n}',cursorOffset:24},
+      {label:'for',detail:'For loop',insert:'for (int i = 0; i < 10; i++) {\n    \n}',cursorOffset:34}
+    ],
+    c: [
+      {label:'main',detail:'C main function',insert:'#include <stdio.h>\n\nint main(void) {\n    \n    return 0;\n}',cursorOffset:42},
+      {label:'printf',detail:'Print to console',insert:'printf("%d\\n", value);',cursorOffset:14},
+      {label:'if',detail:'If statement',insert:'if (condition) {\n    \n}',cursorOffset:15},
+      {label:'for',detail:'For loop',insert:'for (int i = 0; i < n; i++) {\n    \n}',cursorOffset:31}
+    ],
+    cpp: [
+      {label:'main',detail:'C++ main function',insert:'#include <iostream>\nusing namespace std;\n\nint main() {\n    \n    return 0;\n}',cursorOffset:59},
+      {label:'cout',detail:'Print to console',insert:'cout << "Hello, world!" << endl;',cursorOffset:7},
+      {label:'class',detail:'Class template',insert:'class ClassName {\npublic:\n    \n};',cursorOffset:31},
+      {label:'for',detail:'For loop',insert:'for (int i = 0; i < n; i++) {\n    \n}',cursorOffset:31}
+    ],
+    csharp: [
+      {label:'main',detail:'C# entry point',insert:'using System;\n\nclass Program {\n    static void Main() {\n        \n    }\n}',cursorOffset:62},
+      {label:'cw',detail:'Console.WriteLine',insert:'Console.WriteLine();',cursorOffset:19},
+      {label:'class',detail:'Class template',insert:'class ClassName {\n    \n}',cursorOffset:20}
+    ],
+    php: [
+      {label:'php',detail:'PHP opening tag and print example',insert:'<?php\necho "Hello, world!";\n',cursorOffset:7},
+      {label:'echo',detail:'Echo output',insert:'echo "Hello, world!";',cursorOffset:6},
+      {label:'function',detail:'PHP function',insert:'function functionName() {\n    \n}',cursorOffset:23},
+      {label:'foreach',detail:'Foreach loop',insert:'foreach ($items as $item) {\n    \n}',cursorOffset:27}
+    ],
+    ruby: [
+      {label:'puts',detail:'Print to console',insert:'puts "Hello, world!"',cursorOffset:5},
+      {label:'def',detail:'Method definition',insert:'def method_name\n  \nend',cursorOffset:19},
+      {label:'class',detail:'Class template',insert:'class ClassName\n  \nend',cursorOffset:19},
+      {label:'each',detail:'Each loop',insert:'items.each do |item|\n  \nend',cursorOffset:22}
+    ],
+    swift: [
+      {label:'print',detail:'Print to console',insert:'print("Hello, world!")',cursorOffset:7},
+      {label:'func',detail:'Function template',insert:'func functionName() {\n    \n}',cursorOffset:22},
+      {label:'struct',detail:'Struct template',insert:'struct TypeName {\n    \n}',cursorOffset:18},
+      {label:'if',detail:'If statement',insert:'if condition {\n    \n}',cursorOffset:3}
+    ],
+    kotlin: [
+      {label:'main',detail:'Kotlin main function',insert:'fun main() {\n    \n}',cursorOffset:16},
+      {label:'println',detail:'Print to console',insert:'println("Hello, world!")',cursorOffset:9},
+      {label:'fun',detail:'Function template',insert:'fun functionName() {\n    \n}',cursorOffset:21},
+      {label:'when',detail:'When expression',insert:'when (value) {\n    else -> \n}',cursorOffset:27}
+    ],
+    rust: [
+      {label:'main',detail:'Rust main function',insert:'fn main() {\n    \n}',cursorOffset:15},
+      {label:'println',detail:'Print to console',insert:'println!("Hello, world!");',cursorOffset:9},
+      {label:'fn',detail:'Function template',insert:'fn function_name() {\n    \n}',cursorOffset:19},
+      {label:'let',detail:'Variable declaration',insert:'let variable = value;\n',cursorOffset:14},
+      {label:'match',detail:'Match expression',insert:'match value {\n    _ => {},\n}',cursorOffset:12}
+    ]
+,
+    typescript: [
+      {label:'hello',detail:'Typed console output',insert:'const message: string = "Hello, TypeScript!";\nconsole.log(message);',cursorOffset:27},
+      {label:'interface',detail:'Interface declaration',insert:'interface User {\n  id: number;\n  name: string;\n}\n',cursorOffset:18},
+      {label:'function',detail:'Typed function',insert:'function add(a: number, b: number): number {\n  return a + b;\n}\n',cursorOffset:18},
+      {label:'type',detail:'Type alias',insert:'type Status = "ready" | "loading" | "done";\n',cursorOffset:5}
+    ],
+    sql: [
+      {label:'select',detail:'SELECT query',insert:'SELECT *\nFROM table_name\nWHERE condition;\n',cursorOffset:23},
+      {label:'create',detail:'Create a table',insert:'CREATE TABLE users (\n  id INTEGER PRIMARY KEY,\n  name TEXT NOT NULL\n);\n',cursorOffset:19},
+      {label:'insert',detail:'Insert a row',insert:"INSERT INTO users (name) VALUES ('Suraj');\n",cursorOffset:31},
+      {label:'join',detail:'INNER JOIN query',insert:'SELECT a.*, b.*\nFROM table_a AS a\nINNER JOIN table_b AS b ON a.id = b.a_id;\n',cursorOffset:7}
+    ]  };
+
+  function isHtmlPath(path) { return ['html', 'htm'].includes(extensionOf(path)); }
+  function isTextProjectPath(path) {
+    return ['html','htm','css','js','mjs','cjs','json','txt','md','xml','svg','webmanifest','csv','yml','yaml','ts','tsx','mts','cts','jsx','py','java','c','h','cpp','cc','cxx','hpp','hxx','hh','cs','php','rb','swift','kt','kts','rs','sql'].includes(extensionOf(path));
+  }
+
+  function addFolderAncestors(path) {
+    const clean = normalizeProjectPath(path);
+    let current = '';
+    const parts = clean ? clean.split('/') : [];
+    for (let i = 0; i < parts.length; i++) {
+      current = current ? current + '/' + parts[i] : parts[i];
+      projectFolders.add(current);
+    }
+  }
+
+  // A record looks like the old plain object, but reads and writes go to the CRDT.
+  function makeFileRecord(fid) {
+    return {
+      fid,
+      get content() { return crdt.text(fid); },
+      set content(value) { setFileText(fid, String(value ?? '')); },
+      get dataUrl() { return crdt.get(fid, 'data') || localData.get(fid) || ''; },
+      set dataUrl(value) { setFileData(fid, value); },
+      get type() { return crdt.get(fid, 'type') || ''; },
+      get blob() { return localBlobs.get(fid) || null; },
+      set blob(value) { if (value) localBlobs.set(fid, value); else localBlobs.delete(fid); },
+      get handle() { return localHandles.get(fid) || null; },
+      set handle(value) { if (value) localHandles.set(fid, value); else localHandles.delete(fid); }
+    };
+  }
+
+  // Replace a file's text with a minimal edit (common prefix/suffix kept), so teammates'
+  // concurrent edits elsewhere in the file are preserved.
+  function setFileText(fid, next, caretHint) {
+    const prev = crdt.text(fid);
+    if (prev === next) return [];
+    let maxPrefix = Math.min(prev.length, next.length);
+    const delta = next.length - prev.length;
+    if (typeof caretHint === 'number') maxPrefix = Math.min(maxPrefix, Math.max(0, delta > 0 ? caretHint - delta : caretHint));
+    let p = 0;
+    while (p < maxPrefix && prev.charCodeAt(p) === next.charCodeAt(p)) p++;
+    let q = 0;
+    const maxSuffix = Math.min(prev.length, next.length) - p;
+    while (q < maxSuffix && prev.charCodeAt(prev.length - 1 - q) === next.charCodeAt(next.length - 1 - q)) q++;
+    const ops = [];
+    const removed = prev.length - p - q;
+    if (removed > 0) ops.push(crdt.delete(fid, p, removed));
+    const inserted = next.slice(p, next.length - q);
+    if (inserted) ops.push(crdt.insert(fid, p, inserted));
+    return ops.filter(Boolean);
+  }
+
+  function setFileData(fid, dataUrl) {
+    if (!dataUrl) return;
+    if (dataUrl.length <= MAX_SYNCED_DATA_URL) { if (crdt.get(fid, 'data') !== dataUrl) crdt.set(fid, 'data', dataUrl); }
+    else localData.set(fid, dataUrl);
+  }
+
+  function putProjectFile(path, record = {}) {
+    const clean = normalizeProjectPath(path);
+    if (!clean) return '';
+    let fid = pathToFid.get(clean);
+    if (!fid) { fid = newFileId(); crdt.set(fid, 'name', clean); }
+    if (typeof record.content === 'string') setFileText(fid, record.content);
+    if (record.type && crdt.get(fid, 'type') !== record.type) crdt.set(fid, 'type', record.type);
+    if (record.dataUrl) setFileData(fid, record.dataUrl);
+    if (record.blob) localBlobs.set(fid, record.blob);
+    if (record.handle) localHandles.set(fid, record.handle);
+    rebuildProjectView();
+    return fidToPath.get(fid) || clean;
+  }
+
+  // Rebuild the path-keyed view of the shared project.
+  function rebuildProjectView() {
+    const oldActiveFid = pathToFid.get(activePath) || editorFid;
+    const oldTabFids = openTabs.map(p => pathToFid.get(p)).filter(Boolean);
+    const oldSelectedFid = pathToFid.get(selectedTreePath);
+    projectFiles.clear(); fidToPath.clear(); pathToFid.clear();
+    const fids = crdt.fileIds().sort();
+    for (const fid of fids) {
+      let path = normalizeProjectPath(crdt.get(fid, 'name')) || 'untitled.txt';
+      if (pathToFid.has(path)) {
+        // Two people created files with the same name: show both instead of losing one.
+        const dot = path.lastIndexOf('.') > path.lastIndexOf('/') ? path.lastIndexOf('.') : path.length;
+        let n = 2;
+        while (pathToFid.has(path.slice(0, dot) + ' (' + n + ')' + path.slice(dot))) n++;
+        path = path.slice(0, dot) + ' (' + n + ')' + path.slice(dot);
+      }
+      projectFiles.set(path, makeFileRecord(fid));
+      fidToPath.set(fid, path); pathToFid.set(path, fid);
+    }
+    projectFolders.clear(); projectFolders.add('');
+    for (const folder of crdt.folders()) addFolderAncestors(folder);
+    for (const path of projectFiles.keys()) addFolderAncestors(parentPath(path));
+    // Keep tabs and the active file pointing at the same files after renames.
+    if (oldTabFids.length) {
+      openTabs.length = 0;
+      for (const fid of oldTabFids) if (fidToPath.has(fid) && !openTabs.includes(fidToPath.get(fid))) openTabs.push(fidToPath.get(fid));
+    }
+    if (oldActiveFid && fidToPath.has(oldActiveFid)) activePath = fidToPath.get(oldActiveFid);
+    if (oldSelectedFid && fidToPath.has(oldSelectedFid)) selectedTreePath = fidToPath.get(oldSelectedFid);
+  }
+
+  // Push whatever is in the textarea into the shared document (called after every edit).
+  function saveActiveEditorToProject() {
+    if (!editorFid) return;
+    const ops = setFileText(editorFid, editor.value, editor.selectionEnd);
+    const now = Date.now();
+    for (const op of ops) undoMgr.track(op, now);
+  }
+
+  function loadFileIntoEditor(path) {
+    editorFid = pathToFid.get(path) || null;
+    editor.value = editorFid ? crdt.text(editorFid) : '';
+    undoMgr.stopCapturing();
+  }
+
+  function resolveProjectPath(fromPath, reference) {
+    let ref = String(reference || '').trim();
+    if (!ref || /^(?:[a-z][a-z0-9+.-]*:|\/\/|#|data:|blob:)/i.test(ref)) return null;
+    try { ref = decodeURIComponent(ref); } catch (e) {}
+    ref = ref.split(/[?#]/)[0];
+    if (!ref) return null;
+    const base = ref.startsWith('/') ? '' : parentPath(fromPath);
+    return normalizeProjectPath((base ? base + '/' : '') + ref);
+  }
+
+  function localProjectRecord(fromPath, reference) {
+    const resolved = resolveProjectPath(fromPath, reference);
+    if (!resolved) return null;
+    if (projectFiles.has(resolved)) return { path: resolved, record: projectFiles.get(resolved) };
+    // Also accept references that name a root-level asset while editing a nested file.
+    const root = normalizeProjectPath(reference);
+    if (projectFiles.has(root)) return { path: root, record: projectFiles.get(root) };
+    const fileName = baseName(reference);
+    const match = Array.from(projectFiles.entries()).find(([path]) => baseName(path) === fileName);
+    return match ? { path: match[0], record: match[1] } : null;
+  }
+
+  function escapeAttribute(value) {
+    return String(value).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function inlineCssProjectFile(path, seen = new Set()) {
+    if (seen.has(path)) return '/* CSS import cycle skipped: ' + path.replace(/\*\//g, '') + ' */';
+    const rec = projectFiles.get(path);
+    if (!rec) return '';
+    seen.add(path);
+    let css = rec.content || '';
+    css = css.replace(/@import\s+(?:url\(\s*)?(["'])(.*?)\1\s*\)?\s*;/gi, (full, quote, ref) => {
+      const found = localProjectRecord(path, ref);
+      if (!found || extensionOf(found.path) !== 'css') return full;
+      return '\n/* @import ' + found.path.replace(/\*\//g, '') + ' */\n' + inlineCssProjectFile(found.path, seen) + '\n';
+    });
+    css = css.replace(/url\(\s*(["']?)(.*?)\1\s*\)/gi, (full, quote, ref) => {
+      const cleaned = String(ref).trim();
+      const found = localProjectRecord(path, cleaned);
+      if (found && found.record.dataUrl) return 'url("' + found.record.dataUrl + '")';
+      const media = mediaMap.get(baseName(cleaned));
+      if (media && !/^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(cleaned)) return 'url("' + media + '")';
+      return full;
+    });
+    seen.delete(path);
+    return css;
+  }
+
+  function assembleProjectPreview(html, htmlPath) {
+    let output = html;
+    // Inline linked stylesheets so a project folder can preview inside srcdoc.
+    output = output.replace(/<link\b([^>]*?)>/gi, (tag, attrs) => {
+      const relMatch = attrs.match(/\brel\s*=\s*(["'])(.*?)\1/i);
+      const hrefMatch = attrs.match(/\bhref\s*=\s*(["'])(.*?)\1/i);
+      if (!relMatch || !/stylesheet/i.test(relMatch[2]) || !hrefMatch) return tag;
+      const found = localProjectRecord(htmlPath, hrefMatch[2]);
+      if (!found || extensionOf(found.path) !== 'css') return tag;
+      return '<style data-project-file="' + escapeAttribute(found.path) + '">\n' + inlineCssProjectFile(found.path) + '\n</style>';
+    });
+
+    // Inline external classic JavaScript files from the workspace.
+    output = output.replace(/<script\b([^>]*)>\s*<\/script\s*>/gi, (tag, attrs) => {
+      const srcMatch = attrs.match(/\bsrc\s*=\s*(["'])(.*?)\1/i);
+      if (!srcMatch) return tag;
+      const found = localProjectRecord(htmlPath, srcMatch[2]);
+      if (!found || !['js','mjs','cjs'].includes(extensionOf(found.path))) return tag;
+      const cleanAttrs = attrs.replace(/\s+src\s*=\s*(["']).*?\1/i, '').replace(/\s+defer(?:\s|$)/i, '');
+      const code = (found.record.content || '').replace(/<\/script/gi, '<\\/script');
+      return '<script' + cleanAttrs + '>\n/* project file: ' + found.path.replace(/\*\//g, '') + ' */\n' + code + '\n<\/script>';
+    });
+
+    // Replace paths to imported binary assets with data URLs.
+    output = output.replace(/\b(src|poster|data)\s*=\s*(["'])(.*?)\2/gi, (full, attr, quote, ref) => {
+      const found = localProjectRecord(htmlPath, ref);
+      if (found && found.record.dataUrl) return attr + '=' + quote + found.record.dataUrl + quote;
+      const media = mediaMap.get(baseName(ref));
+      return media && !/^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(ref) ? attr + '=' + quote + media + quote : full;
+    });
+
+    // Add a source-to-source navigation bridge for links to other HTML files.
+    output += '\n<script>\n' +
+      'addEventListener("message",function(e){if(e.data==="__print_preview__")print();});\n' +
+      'document.addEventListener("click",function(e){var a=e.target&&e.target.closest?e.target.closest("a[href]"):null;if(!a)return;var h=a.getAttribute("href")||"";if(/^(?:[a-z][a-z0-9+.-]*:|\\/\\/|#|mailto:|tel:|javascript:)/i.test(h))return;if(/\\.html?(?:[?#]|$)/i.test(h)){e.preventDefault();parent.postMessage({__projectNavigate:h,__projectFromPath:' + JSON.stringify(htmlPath) + '},"*");}});\n' +
+      '<\/script>';
+    return output;
+  }
+
+  function renderProjectTree() {
+    const tree = document.getElementById('projectTree');
+    if (!tree) return;
+    tree.textContent = '';
+    const makeRow = (path, kind, depth) => {
+      const row = document.createElement('div');
+      row.className = 'tree-row';
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'tree-entry ' + (kind === 'folder' ? 'tree-folder' : 'tree-file') + (kind === 'file' && path === activePath ? ' active' : '');
+      button.style.paddingLeft = (6 + depth * 14) + 'px';
+      button.title = path || 'Project root';
+      const icon = document.createElement('span');
+      icon.className = 'tree-icon';
+      icon.textContent = kind === 'folder' ? (collapsedFolders.has(path) ? '▸' : '▾') : (extensionOf(path) === 'html' || extensionOf(path) === 'htm' ? '🌐' : extensionOf(path) === 'css' ? '🎨' : ['ts','tsx','mts','cts'].includes(extensionOf(path)) ? 'TS' : extensionOf(path) === 'sql' ? 'SQL' : ['js','mjs','cjs','jsx'].includes(extensionOf(path)) ? 'JS' : extensionOf(path) === 'py' ? 'Py' : ['java','c','h','cpp','cc','cxx','hpp','cs','php','rb','swift','kt','kts','rs'].includes(extensionOf(path)) ? extensionOf(path).toUpperCase() : ['png','jpg','jpeg','gif','webp','svg','ico'].includes(extensionOf(path)) ? '▧' : '·');
+      const label = document.createElement('span');
+      label.className = 'tree-label';
+      label.textContent = kind === 'folder' ? baseName(path) : baseName(path);
+      button.append(icon, label);
+      if (kind === 'file') {
+        // Coloured dots: which teammates have this file open right now.
+        const fid = pathToFid.get(path);
+        for (const peer of collabPeers.values()) {
+          if (!peer.state || peer.state.fid !== fid) continue;
+          const dot = document.createElement('span');
+          dot.className = 'presence-dot';
+          dot.style.background = peer.state.color;
+          dot.title = peer.state.name + ' is in this file';
+          button.appendChild(dot);
+        }
+      }
+      button.addEventListener('click', () => {
+        selectedTreePath = path;
+        if (kind === 'folder') {
+          if (collapsedFolders.has(path)) collapsedFolders.delete(path); else collapsedFolders.add(path);
+          renderProjectTree();
+        } else openProjectFile(path);
+      });
+      row.appendChild(button);
+      tree.appendChild(row);
+    };
+    const renderFolder = (folder, depth) => {
+      if (folder) makeRow(folder, 'folder', depth);
+      if (folder && collapsedFolders.has(folder)) return;
+      const prefix = folder ? folder + '/' : '';
+      const dirs = Array.from(projectFolders).filter(item => item && parentPath(item) === folder).sort((a,b) => baseName(a).localeCompare(baseName(b)));
+      const files = Array.from(projectFiles.keys()).filter(path => parentPath(path) === folder).sort((a,b) => baseName(a).localeCompare(baseName(b)));
+      // Show subfolders before files, as in a conventional project explorer.
+      dirs.forEach(dir => renderFolder(dir, depth + (folder ? 1 : 0)));
+      files.forEach(path => makeRow(path, 'file', depth + (folder ? 1 : 0)));
+    };
+    renderFolder('', 0);
+    const count = projectFiles.size;
+    document.getElementById('projectStats').textContent = count + (count === 1 ? ' file' : ' files');
+  }
+
+  function renderFileTabs() {
+    const strip = document.getElementById('fileTabs');
+    if (!strip) return;
+    strip.textContent = '';
+    openTabs.forEach(path => {
+      if (!projectFiles.has(path)) return;
+      const tab = document.createElement('div');
+      tab.className = 'file-tab' + (path === activePath ? ' active' : '');
+      const name = document.createElement('span');
+      name.className = 'file-tab-name';
+      name.textContent = baseName(path);
+      name.title = path;
+      name.addEventListener('click', () => openProjectFile(path));
+      const close = document.createElement('button');
+      close.type = 'button'; close.className = 'file-tab-close'; close.title = 'Close tab'; close.textContent = '×';
+      close.addEventListener('click', event => { event.stopPropagation(); closeProjectTab(path); });
+      tab.append(name, close); strip.appendChild(tab);
+    });
+  }
+
+  function openProjectFile(path, fromPreview = false) {
+    const clean = normalizeProjectPath(path);
+    if (!projectFiles.has(clean)) { status.textContent = 'File not found in this project: ' + clean; return; }
+    saveActiveEditorToProject();
+    if (fileHandle && activePath === handlePath) { clearTimeout(saveTimer); writeNow(); }
+    activePath = clean;
+    selectedTreePath = clean;
+    if (modeOfPath(clean) === 'python') {
+      // Warm up the runtime as soon as a Python file is opened, not only after Run.
+      ensureLocalPythonRuntime().catch(() => {});
+    }
+    if (!openTabs.includes(clean)) openTabs.push(clean);
+    loadFileIntoEditor(clean);
+    collabAfterFileSwitch();
+    fileNameEl.textContent = clean + ' · ' + languageNameForMode(modeOfPath(clean));
+    editor.setAttribute('aria-label', languageNameForMode(modeOfPath(clean)) + ' code editor');
+    renderFileTabs(); renderProjectTree(); updateEditor(); run();
+    if (!fromPreview) status.textContent = 'Opened ' + clean + (projectFiles.get(clean).handle ? ' · changes can be saved to the project folder' : '');
+  }
+
+  function closeProjectTab(path) {
+    saveActiveEditorToProject();
+    const index = openTabs.indexOf(path);
+    if (index >= 0) openTabs.splice(index, 1);
+    if (activePath === path) {
+      const next = openTabs[Math.max(0, index - 1)] || openTabs[0] || (projectFiles.has('index.html') ? 'index.html' : projectFiles.keys().next().value);
+      if (next) openProjectFile(next);
+      else { activePath = ''; editorFid = null; editor.value = ''; collabAfterFileSwitch(); fileNameEl.textContent = 'No file open'; editor.setAttribute('aria-label', 'Code editor'); updateEditor(); run(); renderFileTabs(); }
+    } else renderFileTabs();
+  }
+
+  function renderAllProjectUi() { renderProjectTree(); renderFileTabs(); }
+
+  async function readFileIntoProject(file, path, handle = null) {
+    const clean = normalizeProjectPath(path || file.name);
+    const ext = extensionOf(clean);
+    let content = '';
+    let dataUrl = '';
+    if (isTextProjectPath(clean)) content = await file.text();
+    if (!isTextProjectPath(clean) || ext === 'svg' || ['png','jpg','jpeg','gif','webp','avif','bmp','ico','mp3','wav','ogg','m4a','mp4','webm','mov','pdf','woff','woff2','ttf','otf'].includes(ext)) {
+      try { dataUrl = await readAsDataURL(file); } catch (e) {}
+    }
+    putProjectFile(clean, { content, dataUrl, blob: file, type: file.type || '', handle });
+    return clean;
+  }
+
+  async function importFileList(fileList, keepRelativePaths = false) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    saveActiveEditorToProject();
+    let firstHtml = '';
+    let loaded = 0;
+    for (const file of files) {
+      let path = keepRelativePaths ? (file.webkitRelativePath || file.name).replace(/^[^/]+\//, '') : file.name;
+      path = normalizeProjectPath(path);
+      if (!path) continue;
+      // Avoid silently overwriting a different root file when adding several files.
+      if (!keepRelativePaths && projectFiles.has(path)) {
+        const dir = parentPath(activePath);
+        const candidate = normalizeProjectPath((dir ? dir + '/' : '') + path);
+        path = candidate;
+        if (projectFiles.has(path)) {
+          let n = 2, dot = path.lastIndexOf('.');
+          const stem = dot > path.lastIndexOf('/') ? path.slice(0, dot) : path;
+          const ext = dot > path.lastIndexOf('/') ? path.slice(dot) : '';
+          while (projectFiles.has(stem + '-' + n + ext)) n++;
+          path = stem + '-' + n + ext;
+        }
+      }
+      const added = await readFileIntoProject(file, path);
+      if (!firstHtml && isHtmlPath(added)) firstHtml = added;
+      loaded++;
+    }
+    renderAllProjectUi();
+    const preferred = projectFiles.has('index.html') ? 'index.html' : firstHtml;
+    if (preferred) { activePath = ''; openProjectFile(preferred); }
+    else { renderAllProjectUi(); run(); }
+    status.textContent = 'Added ' + loaded + ' file' + (loaded === 1 ? '' : 's') + ' to the project. Use the Explorer to open any file.';
+  }
+
+  async function importDirectoryHandle(directoryHandle) {
+    saveActiveEditorToProject();
+    // The project is shared, so replacing it affects everyone in the room: ask first.
+    if (projectFiles.size && !confirm('Replace the shared project with the folder "' + directoryHandle.name + '"? Everyone in room "' + collabRoom + '" will see the change.')) return;
+    projectDirectoryHandle = directoryHandle;
+    for (const fid of crdt.fileIds()) crdt.deleteFile(fid);
+    for (const folder of crdt.folders()) crdt.set(DragonCRDT.FOLDERS, folder, false);
+    rebuildProjectView();
+    openTabs.length = 0;
+    async function walk(dir, prefix) {
+      for await (const entry of dir.values()) {
+        const path = normalizeProjectPath(prefix ? prefix + '/' + entry.name : entry.name);
+        if (entry.kind === 'directory') {
+          crdt.set(DragonCRDT.FOLDERS, path, true);
+          await walk(entry, path);
+        } else if (entry.kind === 'file') {
+          const file = await entry.getFile();
+          await readFileIntoProject(file, path, entry);
+        }
+      }
+    }
+    await walk(directoryHandle, '');
+    const preferred = projectFiles.has('index.html') ? 'index.html' : Array.from(projectFiles.keys()).find(isHtmlPath) || projectFiles.keys().next().value;
+    if (preferred) openProjectFile(preferred);
+    renderAllProjectUi();
+    status.textContent = 'Project folder opened: ' + directoryHandle.name + ' · ' + projectFiles.size + ' files loaded.';
+  }
+
+  function suggestStarter(path) {
+    const ext = extensionOf(path);
+    const mode = modeOfPath(path);
+    if (['html','htm'].includes(ext)) return '<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1.0">\n  <title>Document</title>\n  <link rel="stylesheet" href="style.css">\n</head>\n<body>\n  <h1>Hello, world!</h1>\n  <script src="script.js"><\/script>\n</body>\n</html>\n';
+    if (ext === 'css') return '/* Project styles */\nbody {\n  font-family: Arial, sans-serif;\n  margin: 0;\n}\n';
+    if (['js','mjs','cjs','jsx'].includes(ext)) return '// Project JavaScript\nconsole.log("Project ready!");\n';
+    if (mode === 'typescript') return 'interface User { id: number; name: string; }\nconst user: User = { id: 1, name: "TypeScript ready!" };\nconsole.log(user);\n';
+    if (mode === 'sql') return "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);\nDELETE FROM users;\nINSERT INTO users (name) VALUES ('Ada'), ('Grace');\nSELECT * FROM users;\n";
+    if (ext === 'json') return '{\n  "name": "my-project"\n}\n';
+    if (mode === 'python') return 'def main():\n    print("Hello, world!")\n\nif __name__ == "__main__":\n    main()\n';
+    if (mode === 'java') return 'public class Main {\n    public static void main(String[] args) {\n        System.out.println("Hello, world!");\n    }\n}\n';
+    if (mode === 'c') return '#include <stdio.h>\n\nint main(void) {\n    printf("Hello, world!\\n");\n    return 0;\n}\n';
+    if (mode === 'cpp') return '#include <iostream>\n\nint main() {\n    std::cout << "Hello, world!" << std::endl;\n    return 0;\n}\n';
+    if (mode === 'csharp') return 'using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine("Hello, world!");\n    }\n}\n';
+    if (mode === 'php') return '<?php\necho "Hello, world!";\n';
+    if (mode === 'ruby') return 'puts "Hello, world!"\n';
+    if (mode === 'swift') return 'print("Hello, world!")\n';
+    if (mode === 'kotlin') return 'fun main() {\n    println("Hello, world!")\n}\n';
+    if (mode === 'rust') return 'fn main() {\n    println!("Hello, world!");\n}\n';
+    return '';
+  }
+
+  function createProjectFile() {
+    const input = prompt('New file path (examples: index.html, style.css, app.js, main.ts, queries.sql, main.py, Main.java, main.c, main.cpp, Program.cs, index.php, app.rb, main.swift, Main.kt, main.rs):', 'src/app.js');
+    if (!input) return;
+    const path = normalizeProjectPath(input);
+    if (!path) return;
+    if (projectFiles.has(path) && !confirm(path + ' already exists. Replace it?')) return;
+    saveActiveEditorToProject();
+    putProjectFile(path, { content: suggestStarter(path), dataUrl: '', blob: null, type: '', handle: null });
+    if (!openTabs.includes(path)) openTabs.push(path);
+    activePath = '';
+    openProjectFile(path);
+    status.textContent = 'Created ' + path + '.';
+  }
+
+  function createProjectFolder() {
+    const input = prompt('New folder path (examples: css, js/components, assets/images):', parentPath(activePath) || 'assets');
+    if (!input) return;
+    const path = normalizeProjectPath(input);
+    if (!path) return;
+    crdt.set(DragonCRDT.FOLDERS, path, true);
+    rebuildProjectView();
+    renderProjectTree(); status.textContent = 'Created folder ' + path + ' in the project workspace.';
+  }
+
+  function renameActiveProjectFile() {
+    if (!activePath || !projectFiles.has(activePath)) return;
+    const input = prompt('Rename file (include folder path if needed):', activePath);
+    if (!input) return;
+    let next = normalizeProjectPath(input);
+    if (!next || next === activePath) return;
+    if (projectFiles.has(next) && !confirm(next + ' already exists. Replace it?')) return;
+    saveActiveEditorToProject();
+    const record = projectFiles.get(activePath);
+    // Rename = change the name field of the same file ID, so teammates' edits stay attached.
+    const replaced = pathToFid.get(next);
+    if (replaced && replaced !== record.fid) crdt.deleteFile(replaced);
+    crdt.set(record.fid, 'name', next);
+    rebuildProjectView();
+    next = fidToPath.get(record.fid) || next;
+    activePath = next; selectedTreePath = next;
+    fileNameEl.textContent = next + ' · ' + languageNameForMode(modeOfPath(next));
+    editor.setAttribute('aria-label', languageNameForMode(modeOfPath(next)) + ' code editor');
+    renderAllProjectUi(); updateEditor(); run();
+    status.textContent = 'Renamed file to ' + next + '. Check any references that used the old path.';
+  }
+
+  function deleteActiveProjectFile() {
+    if (!activePath || !projectFiles.has(activePath)) return;
+    if (!confirm('Delete ' + activePath + ' from this editor workspace? This does not delete a copy already saved on your computer.')) return;
+    const old = activePath;
+    const index = openTabs.indexOf(old);
+    const oldFid = pathToFid.get(old);
+    crdt.deleteFile(oldFid);   // shared delete; an offline teammate's later edit can bring it back
+    if (editorFid === oldFid) editorFid = null;
+    activePath = '';
+    rebuildProjectView();                // also drops the file from the open tabs
+    const next = openTabs[ Math.max(0, index - 1) ] || openTabs[0] || (projectFiles.has('index.html') ? 'index.html' : projectFiles.keys().next().value);
+    if (next) openProjectFile(next);
+    else {
+      putProjectFile('index.html', { content: suggestStarter('index.html') });
+      openTabs.push('index.html'); openProjectFile('index.html');
+    }
+    renderAllProjectUi(); status.textContent = 'Removed ' + old + ' from this workspace.';
+  }
+
+  async function writeProjectToDirectory(rootHandle) {
+    saveActiveEditorToProject();
+    // Re-create known folders before writing files, including empty folders.
+    async function ensureDir(path) {
+      let dir = rootHandle;
+      for (const segment of normalizeProjectPath(path).split('/').filter(Boolean)) dir = await dir.getDirectoryHandle(segment, { create: true });
+      return dir;
+    }
+    for (const folder of Array.from(projectFolders).filter(Boolean).sort((a,b) => a.split('/').length - b.split('/').length)) await ensureDir(folder);
+    for (const [path, record] of projectFiles.entries()) {
+      const dir = await ensureDir(parentPath(path));
+      const handle = await dir.getFileHandle(baseName(path), { create: true });
+      const writable = await handle.createWritable();
+      // Images that came from a teammate have no local File object, only their data URL.
+      let body = '';
+      if (isTextProjectPath(path)) body = record.content || '';
+      else if (record.blob) body = record.blob;
+      else if (record.dataUrl) body = await (await fetch(record.dataUrl)).blob();
+      await writable.write(body);
+      await writable.close();
+      record.handle = handle;
+    }
+    projectDirectoryHandle = rootHandle;
+  }
+
+  async function saveWholeProject() {
+    if (!projectFiles.size) { status.textContent = 'There are no project files to save yet.'; return; }
+    if (!('showDirectoryPicker' in window)) {
+      status.textContent = 'Saving the complete project folder needs Chrome or Edge. You can still download the current file or open a folder with the Explorer.';
+      return;
+    }
+    try {
+      const dir = projectDirectoryHandle || await window.showDirectoryPicker({ mode: 'readwrite' });
+      await writeProjectToDirectory(dir);
+      status.textContent = 'Saved ' + projectFiles.size + ' project files to folder: ' + dir.name + '.';
+    } catch (e) {
+      if (e && e.name !== 'AbortError') status.textContent = 'Project save failed: ' + e.message;
+    }
+  }
+
+  window.addEventListener('message', event => {
+    if (event.source !== preview.contentWindow || !event.data || !event.data.__projectNavigate) return;
+    const target = resolveProjectPath(event.data.__projectFromPath || activePath, event.data.__projectNavigate);
+    if (target && projectFiles.has(target) && isHtmlPath(target)) openProjectFile(target, true);
+  });
+
+  // Add a small in-preview console so console.log()/warnings/errors are visible
+  // on the output page instead of being hidden in the browser developer tools.
+  function addConsoleCapture(html) {
+    const bridge = '<script>(function(){if(window.__editorConsoleCapture)return;window.__editorConsoleCapture=true;var panel,pre;function printable(v){if(typeof v==="string")return v;try{return JSON.stringify(v,null,2)??String(v)}catch(e){return String(v)}}function ensurePanel(){if(panel)return;panel=document.createElement("section");panel.style.cssText="position:fixed;right:10px;bottom:10px;z-index:2147483647;width:min(460px,calc(100vw - 20px));max-height:220px;display:flex;flex-direction:column;background:#111827;color:#e5e7eb;border:1px solid #475569;border-radius:9px;box-shadow:0 10px 30px #0006;font:12px/1.4 Consolas,monospace;overflow:hidden";var head=document.createElement("div");head.style.cssText="display:flex;align-items:center;justify-content:space-between;padding:7px 10px;background:#1f2937;font:700 12px system-ui,Arial";head.textContent="JavaScript console output";var clear=document.createElement("button");clear.type="button";clear.textContent="Clear";clear.style.cssText="margin-left:10px;border:0;border-radius:4px;padding:3px 7px;background:#475569;color:white;cursor:pointer";clear.onclick=function(){pre.textContent=""};head.appendChild(clear);pre=document.createElement("pre");pre.style.cssText="margin:0;padding:9px 10px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;max-height:175px";panel.appendChild(head);panel.appendChild(pre);(document.body||document.documentElement).appendChild(panel)}function emit(kind,args){ensurePanel();var row="["+kind.toUpperCase()+"] "+Array.prototype.map.call(args,printable).join(" ");pre.textContent+=(pre.textContent?"\\n":"")+row;pre.scrollTop=pre.scrollHeight}["log","info","warn","error","debug"].forEach(function(kind){var orig=console[kind];console[kind]=function(){try{if(orig)orig.apply(console,arguments)}catch(e){}emit(kind,arguments)}});window.addEventListener("error",function(e){emit("error",[e.message||"JavaScript error",e.filename?e.filename+":"+e.lineno:""]) });window.addEventListener("unhandledrejection",function(e){emit("error",["Unhandled promise rejection",e.reason])})})();<\/script>';
+    if (/<head\b[^>]*>/i.test(html)) return html.replace(/<head\b[^>]*>/i, match => match + bridge);
+    const doctype = html.match(/^\s*<!doctype[^>]*>/i);
+    if (doctype) return html.slice(0, doctype[0].length) + bridge + html.slice(doctype[0].length);
+    return bridge + html;
+  }
+
+  let nativeRunSequence = 0;
+  let judgeLanguageListPromise = null;
+  let nativeExpectedInputCount = null;
+  // Preserve Python stdin across output-page refreshes and repeated executions.
+  let nativePythonInputBuffer = '';
+  let nativeTypeScriptInputBuffer = '';
+  // Keep standard input drafts for non-Python native-language output pages.
+  const nativeProgramInputBuffers = Object.create(null);
+  let nativePythonUsesDynamicInput = false;
+
+  function nativeOutputProfile(language) {
+    const rawLanguage = String(language || 'Program');
+    const rawKey = rawLanguage.toLowerCase();
+    const aliases = { 'c++': 'cpp', 'c#': 'csharp' };
+    const key = aliases[rawKey] || rawKey;
+    const profiles = {
+      java: {
+        glyph: 'JVM', panelKicker: 'JAVA PROGRAM CONSOLE', panelTitle: 'Java Output', badge: 'JVM',
+        title: 'Java Program Output', description: 'Compile and run your Java source, then review the program output and diagnostics.',
+        consoleLabel: 'Java console', environmentTitle: 'Java execution',
+        footnote: 'Java code is compiled and executed by the online Judge0 service. Standard input is supplied before execution; interactive terminal sessions are not available.'
+      },
+      c: {
+        glyph: 'C', panelKicker: 'C PROGRAM CONSOLE', panelTitle: 'C Output', badge: 'C / GCC',
+        title: 'C Program Output', description: 'Review standard output, runtime errors, and compiler diagnostics for your C program.',
+        consoleLabel: 'C console', environmentTitle: 'C execution',
+        footnote: 'C code is compiled and executed by the online Judge0 service. Standard input is supplied before execution.'
+      },
+      cpp: {
+        glyph: 'C++', panelKicker: 'C++ PROGRAM CONSOLE', panelTitle: 'C++ Output', badge: 'C++',
+        title: 'C++ Program Output', description: 'Review standard output, runtime errors, and compiler diagnostics for your C++ program.',
+        consoleLabel: 'C++ console', environmentTitle: 'C++ execution',
+        footnote: 'C++ code is compiled and executed by the online Judge0 service. Standard input is supplied before execution.'
+      },
+      csharp: {
+        glyph: 'C#', panelKicker: 'C# PROGRAM CONSOLE', panelTitle: 'C# Output', badge: '.NET',
+        title: 'C# Program Output', description: 'Review your C# program output and any compiler or runtime diagnostics.',
+        consoleLabel: 'C# console', environmentTitle: 'C# execution',
+        footnote: 'C# code is compiled and executed by the online Judge0 service. Standard input is supplied before execution.'
+      },
+      php: {
+        glyph: 'PHP', panelKicker: 'PHP PROGRAM OUTPUT', panelTitle: 'PHP Output', badge: 'PHP CLI',
+        title: 'PHP Program Output', description: 'Review standard output and any PHP error or compiler messages.',
+        consoleLabel: 'PHP output', environmentTitle: 'PHP execution',
+        footnote: 'PHP runs through the online Judge0 service in command-line mode. Standard input is supplied before execution.'
+      },
+      ruby: {
+        glyph: 'rb', panelKicker: 'RUBY PROGRAM CONSOLE', panelTitle: 'Ruby Output', badge: 'RUBY',
+        title: 'Ruby Program Output', description: 'Review printed output and runtime errors from your Ruby program.',
+        consoleLabel: 'Ruby console', environmentTitle: 'Ruby execution',
+        footnote: 'Ruby runs through the online Judge0 service. Standard input is supplied before execution.'
+      },
+      swift: {
+        glyph: 'SW', panelKicker: 'SWIFT PROGRAM CONSOLE', panelTitle: 'Swift Output', badge: 'SWIFT',
+        title: 'Swift Program Output', description: 'Review printed output, compilation messages, and runtime diagnostics.',
+        consoleLabel: 'Swift console', environmentTitle: 'Swift execution',
+        footnote: 'Swift code is compiled and executed by the online Judge0 service. Standard input is supplied before execution.'
+      },
+      kotlin: {
+        glyph: 'KT', panelKicker: 'KOTLIN PROGRAM CONSOLE', panelTitle: 'Kotlin Output', badge: 'KOTLIN',
+        title: 'Kotlin Program Output', description: 'Review printed output and any Kotlin compilation or runtime diagnostics.',
+        consoleLabel: 'Kotlin console', environmentTitle: 'Kotlin execution',
+        footnote: 'Kotlin code is compiled and executed by the online Judge0 service. Standard input is supplied before execution.'
+      },
+      rust: {
+        glyph: 'RS', panelKicker: 'RUST PROGRAM CONSOLE', panelTitle: 'Rust Output', badge: 'RUST',
+        title: 'Rust Program Output', description: 'Review standard output and compiler or runtime diagnostics for your Rust program.',
+        consoleLabel: 'Rust console', environmentTitle: 'Rust execution',
+        footnote: 'Rust code is compiled and executed by the online Judge0 service. Standard input is supplied before execution.'
+      },
+      typescript: {
+        glyph: 'TS', panelKicker: 'TYPESCRIPT PROGRAM CONSOLE', panelTitle: 'TypeScript Output', badge: 'TS RUNNER',
+        title: 'TypeScript Program Output', description: 'TypeScript is compiled in the browser and executed in an isolated worker.',
+        consoleLabel: 'TypeScript console', environmentTitle: 'Browser TypeScript runner',
+        footnote: 'Batch prompt() input is supported. Node.js APIs and package imports are not built in to this browser runner.'
+      },
+      sql: {
+        glyph: 'SQL', panelKicker: 'DATABASE QUERY OUTPUT', panelTitle: 'SQL Query Results', badge: 'SQLITE',
+        title: 'SQLite Query Output', description: 'Run SQL statements and inspect returned rows or database messages.',
+        consoleLabel: 'Query results', environmentTitle: 'SQLite session',
+        footnote: 'SQL runs locally using SQLite compiled to WebAssembly. This is an in-memory SQLite database, not a connection to an external database server.'
+      }
+    };
+    return { key, language: rawLanguage, ...(profiles[key] || {
+      glyph: '</>', panelKicker: 'PROGRAM CONSOLE', panelTitle: rawLanguage + ' Output', badge: 'CONSOLE',
+      title: rawLanguage + ' Program Output', description: 'Review program output and execution diagnostics.',
+      consoleLabel: rawLanguage + ' console', environmentTitle: 'Execution environment',
+      footnote: 'Program output is shown below. The execution environment depends on the selected language.'
+    }) };
+  }
+
+  function setOutputPanelMode(mode, language) {
+    const kicker = document.querySelector('.preview-head-kicker');
+    const title = document.querySelector('.preview-head-title');
+    const badge = document.querySelector('.preview-live-badge');
+    if (!kicker || !title || !badge) return;
+    if (mode === 'browser' || mode === 'python') {
+      kicker.textContent = 'BROWSER CANVAS';
+      title.textContent = 'Live Preview';
+      badge.innerHTML = '<span class="preview-live-dot" aria-hidden="true"></span> LIVE';
+      return;
+    }
+    const profile = nativeOutputProfile(language || mode);
+    kicker.textContent = profile.panelKicker;
+    title.textContent = profile.panelTitle;
+    badge.innerHTML = '<span class="preview-live-dot" aria-hidden="true"></span> ' + escapeHTML(profile.badge);
+  }
+
+  function nativeLanguageOutputPage(language, state, output, details = '') {
+    const profile = nativeOutputProfile(language);
+    const content = String(output || '(Program finished without producing output.)');
+    const sqlMode = profile.key === 'sql';
+    const savedInputValue = profile.key === 'typescript' ? nativeTypeScriptInputBuffer : (nativeProgramInputBuffers[profile.key] || '');
+    const lineCount = savedInputValue === '' ? 0 : savedInputValue.split('\n').length;
+    const stateLower = String(state || '').toLowerCase();
+    const stateClass = /(error|failed|exceeded|exception|invalid)/.test(stateLower)
+      ? 'failed'
+      : /(running|loading|connecting|compiling)/.test(stateLower)
+        ? 'busy'
+        : /(success|accepted|executed|finished)/.test(stateLower)
+          ? 'success'
+          : 'ready';
+
+    const inputPanelHtml = sqlMode
+      ? '<section class="input-card database-card"><div class="card-heading"><div><span class="card-eyebrow">DATABASE SESSION</span><h2>SQLite workspace</h2></div><span class="field-tag">LOCAL</span></div><p>SQL statements execute against an in-memory SQLite database. Create tables and insert rows before running queries that use them.</p></section>'
+      : '<form class="input-card" id="stdinForm"><div class="card-heading"><div><span class="card-eyebrow">RUN CONFIGURATION</span><h2>Program input <span class="inline-muted">(stdin)</span></h2></div><span class="field-tag">BATCH INPUT</span></div><label class="input-label" for="stdinText">Enter values in the order your program reads them</label><textarea id="stdinText" spellcheck="false" placeholder="Type input values, one per line...">' + escapeHTML(savedInputValue) + '</textarea><div class="input-foot"><span id="inputStats">' + lineCount + ' line(s) · ' + savedInputValue.length + ' characters</span><span>Ctrl + Enter to run</span></div><p id="inputError" role="alert"></p><button class="run-input" type="submit"><span aria-hidden="true">▶</span> Run with Input</button></form>';
+
+    const detailsHtml = details
+      ? '<section class="details-card"><span class="card-eyebrow">EXECUTION DETAILS</span><p>' + escapeHTML(details) + '</p></section>'
+      : '';
+    const page = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHTML(profile.title)}</title><style>
+      *{box-sizing:border-box}body{margin:0;padding:clamp(12px,2.8vw,24px);background:radial-gradient(ellipse at 100% 0%,#dbeafe 0,transparent 38%),#f1f5f9;color:#0f172a;font:14px/1.55 system-ui,-apple-system,Segoe UI,Arial,sans-serif}.wrap{max-width:980px;margin:0 auto}.hero{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap;margin:0 0 16px}.brand{display:flex;align-items:center;gap:13px;min-width:0}.glyph{display:grid;place-items:center;flex:0 0 47px;width:47px;height:47px;border:1px solid #bfdbfe;border-radius:13px;background:linear-gradient(140deg,#dbeafe,#ede9fe);color:#1d4ed8;font:850 12px/1 Consolas,monospace;box-shadow:0 5px 15px #1d4ed81a}.intro{min-width:0}.eyebrow,.card-eyebrow{display:block;color:#64748b;font-size:9px;font-weight:850;letter-spacing:.16em;text-transform:uppercase}.hero h1{margin:3px 0 4px;font-size:clamp(18px,2.4vw,25px);line-height:1.2;letter-spacing:-.035em}.sub{margin:0;color:#64748b;font-size:12px;max-width:630px}.state{flex:0 0 auto;max-width:100%;padding:6px 10px;border:1px solid #cbd5e1;border-radius:999px;background:#fff;color:#334155;font-size:11px;font-weight:800;overflow-wrap:anywhere}.state.success{border-color:#bbf7d0;background:#f0fdf4;color:#166534}.state.failed{border-color:#fecaca;background:#fef2f2;color:#b91c1c}.state.busy{border-color:#fde68a;background:#fffbeb;color:#92400e}.console-card,.input-card,.details-card,.env-card{overflow:hidden;border:1px solid #dbe3ef;border-radius:14px;background:#fff;box-shadow:0 8px 22px #0f172a0a}.console-head{display:flex;align-items:center;gap:10px;min-height:43px;padding:10px 13px;border-bottom:1px solid #263449;background:linear-gradient(100deg,#172033,#0f172a);color:#dbeafe}.dots{display:flex;gap:4px}.dots i{display:block;width:7px;height:7px;border-radius:50%;background:#64748b}.dots i:first-child{background:#f87171}.dots i:nth-child(2){background:#fbbf24}.dots i:nth-child(3){background:#4ade80}.console-title{min-width:0;font-size:11px;font-weight:800}.stream{margin-left:auto;color:#94a3b8;font-size:10px;white-space:nowrap}.out{margin:0;min-height:180px;max-height:46vh;overflow:auto;padding:17px;background:#0b1020;color:#e5e7eb;white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.7 Consolas,Monaco,monospace}.input-card,.details-card,.env-card{margin-top:14px;padding:15px}.card-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}.card-heading h2{margin:3px 0 0;font-size:15px;line-height:1.3}.inline-muted{color:#64748b;font-size:11px;font-weight:600}.field-tag{display:inline-flex;align-items:center;padding:5px 8px;border:1px solid #c7d2fe;border-radius:7px;background:#eef2ff;color:#4338ca;font-size:9px;font-weight:850;letter-spacing:.08em}.input-label{display:block;margin-bottom:7px;color:#334155;font-size:12px;font-weight:700}.input-card textarea{display:block;width:100%;min-height:90px;resize:vertical;padding:11px;border:1px solid #cbd5e1;border-radius:9px;outline:none;background:#f8fafc;color:#0f172a;font:13px/1.55 Consolas,monospace}.input-card textarea:focus{border-color:#60a5fa;box-shadow:0 0 0 3px #60a5fa26}.input-foot{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:7px;color:#64748b;font-size:10px}.input-card #inputError{margin:0;color:#b91c1c;font-size:11px}.run-input{display:inline-flex;align-items:center;gap:8px;margin-top:10px;padding:10px 13px;border:1px solid #15803d;border-radius:9px;background:linear-gradient(135deg,#16a34a,#047857);color:#fff;font-weight:800;font-size:12px;cursor:pointer}.run-input:hover{filter:brightness(1.05)}.database-card p,.details-card p{margin:7px 0 0;color:#475569;font-size:12px}.env-card{display:flex;align-items:flex-start;gap:10px;background:#f8fafc}.env-dot{flex:0 0 8px;width:8px;height:8px;margin-top:5px;border-radius:50%;background:#60a5fa;box-shadow:0 0 0 4px #dbeafe}.env-card strong{display:block;color:#334155;font-size:11px}.env-card p{margin:3px 0 0;color:#64748b;font-size:11px}.details-card{background:#f8fafc}.details-card p{overflow-wrap:anywhere}@media(max-width:480px){.glyph{flex-basis:39px;width:39px;height:39px;border-radius:10px}.hero{gap:10px}.out{min-height:150px;padding:13px}.input-card,.details-card,.env-card{padding:12px}.stream{font-size:9px}}
+      </style></head><body><main class="wrap"><header class="hero"><div class="brand"><div class="glyph" aria-hidden="true">${escapeHTML(profile.glyph)}</div><div class="intro"><span class="eyebrow">${escapeHTML(profile.panelKicker)}</span><h1>${escapeHTML(profile.title)}</h1><p class="sub">${escapeHTML(profile.description)}</p></div></div><span class="state ${stateClass}">${escapeHTML(state)}</span></header><section class="console-card"><div class="console-head"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="console-title">${escapeHTML(profile.consoleLabel)}</span><span class="stream">${sqlMode ? 'QUERY RESULTS' : 'STDOUT / STDERR'}</span></div><pre class="out">${escapeHTML(content)}</pre></section>${inputPanelHtml}${detailsHtml}<section class="env-card"><span class="env-dot" aria-hidden="true"></span><div><strong>${escapeHTML(profile.environmentTitle)}</strong><p>${escapeHTML(profile.footnote)}</p></div></section></main><script>(function(){var form=document.getElementById('stdinForm');var box=document.getElementById('stdinText');var stats=document.getElementById('inputStats');var err=document.getElementById('inputError');function updateStats(){if(stats&&box){var value=box.value;stats.textContent=(value===''?0:value.split('\\n').length)+' line(s) · '+value.length+' characters';}}if(box){box.addEventListener('input',function(){updateStats();parent.postMessage({__nativeInputDraft:true,languageKey:${JSON.stringify(profile.key)},input:box.value},'*');});box.addEventListener('keydown',function(event){if((event.ctrlKey||event.metaKey)&&event.key==='Enter'&&form){event.preventDefault();form.requestSubmit();}});updateStats();}if(form&&box){form.addEventListener('submit',function(event){event.preventDefault();if(err)err.textContent='';parent.postMessage({__nativeRunWithInput:true,input:box.value},'*');});}})();<\/script></body></html>`;
+
+    setOutputPanelMode(profile.key, language);
+    preview.srcdoc = page;
+    const label = document.getElementById('previewEntryLabel');
+    if (label) label.textContent = language + ' · Program output';
+  }
+
+  function nativeOutputPage(language, state, output, details = '') {
+    if (String(language).toLowerCase() !== 'python') {
+      nativeLanguageOutputPage(language, state, output, details);
+      return;
+    }
+    setOutputPanelMode('browser');
+    const content = String(output || '(Program finished without producing output.)');
+    const isPythonPage = language.toLowerCase() === 'python';
+    const isSqlPage = language.toLowerCase() === 'sql';
+    const isTypeScriptPage = language.toLowerCase() === 'typescript';
+    const expectedCount = nativeExpectedInputCount;
+    const inputMode = isPythonPage
+      ? (nativePythonUsesDynamicInput ? 'dynamic' : (Number.isInteger(expectedCount) ? 'fixed' : 'free'))
+      : 'native';
+    const savedInputValue = isPythonPage ? nativePythonInputBuffer : (isTypeScriptPage ? nativeTypeScriptInputBuffer : '');
+    const initialLineCount = savedInputValue === '' ? 0 : savedInputValue.split('\n').length;
+    let inputHint = 'Enter program input, one value per line.';
+    if (isPythonPage && inputMode === 'fixed') {
+      inputHint = expectedCount === 0
+        ? 'This code has no detected input() calls. Input is limited to 0 lines.'
+        : 'Input is limited to exactly ' + expectedCount + ' line' + (expectedCount === 1 ? '' : 's') + '. Extra lines are blocked.';
+    } else if (isPythonPage && inputMode === 'dynamic') {
+      inputHint = 'Variable-input mode: enter a non-negative count N on the first line, then exactly N more data lines. Extra lines are blocked.';
+    } else if (isPythonPage) {
+      inputHint = 'No input limit could be inferred for this code. Enter values in the order Python reads them.';
+    } else if (Number.isInteger(expectedCount)) {
+      inputHint = expectedCount === 0 ? 'Required input lines: 0.' : 'Required input lines: ' + expectedCount + '.';
+    }
+    const inputLabel = isPythonPage
+      ? (inputMode === 'fixed' ? ' (' + expectedCount + ' line' + (expectedCount === 1 ? '' : 's') + ' allowed)' : inputMode === 'dynamic' ? ' (first line sets the limit)' : ' (input)')
+      : (Number.isInteger(expectedCount) ? ' (' + expectedCount + ' required line' + (expectedCount === 1 ? '' : 's') + ')' : '');
+    const inputPlaceholder = isPythonPage && inputMode === 'fixed'
+      ? (expectedCount === 0 ? 'No input required for this code.' : 'Enter exactly ' + expectedCount + ' line' + (expectedCount === 1 ? '' : 's') + '.')
+      : isPythonPage && inputMode === 'dynamic'
+        ? 'First line: N, followed by exactly N more lines.'
+        : 'Type input values, one per line.';
+
+    // Only Python gets a line restriction. Fixed straight-line input() calls are
+    // capped to their detected count; loop-based input uses the first line N as
+    // a count of following data lines (total N + 1 lines).
+    const inputLimitScript = isPythonPage
+      ? 'var limitMode=' + JSON.stringify(inputMode) + ';var requiredLines=' + (Number.isInteger(expectedCount) ? String(expectedCount) : 'null') + ';' +
+        'function lineCount(v){return v===""?0:String(v).split("\\n").length;}' +
+        'function getLineLimit(v){if(limitMode==="fixed")return Math.max(0,Number(requiredLines)||0);if(limitMode==="dynamic"){var first=String(v).split("\\n",1)[0].trim();if(!/^(0|[1-9]\\d*)$/.test(first))return null;var n=Number(first);if(!Number.isSafeInteger(n)||n>100000)return null;return n+1;}return null;}' +
+        'function updateInputUI(showLimitMessage){var v=box.value;var lines=lineCount(v);var limit=getLineLimit(v);if(stats){if(limit!==null)stats.textContent="Input lines: "+lines+" / "+limit+" · Characters: "+v.length+" · Extra lines blocked";else if(limitMode==="dynamic")stats.textContent="Input lines: "+lines+" · Characters: "+v.length+" · Enter a whole-number count on the first line";else stats.textContent="Input lines: "+lines+" · Characters: "+v.length;}if(hint){if(limitMode==="fixed")hint.textContent=requiredLines===0?"No input lines are required.":"Exactly "+requiredLines+" input line(s) allowed; extra lines are blocked.";else if(limitMode==="dynamic")hint.textContent=limit===null?"Enter a non-negative whole number on the first line to set the limit.":"Limit: "+limit+" total lines (first line + "+(limit-1)+" data line(s)).";}if(showLimitMessage&&limit!==null&&lines>=limit)err.textContent="Input limit reached ("+limit+" lines). Extra lines are blocked.";}' +
+        'function clampInput(){var before=box.value;var limit=getLineLimit(before);if(limitMode==="dynamic"&&limit===null&&before.indexOf("\\n")!==-1){var firstOnly=before.split("\\n")[0];var pos=Math.min(box.selectionStart||0,firstOnly.length);box.value=firstOnly;try{box.setSelectionRange(pos,pos);}catch(e){}err.textContent="Enter a non-negative whole-number count on the first line before adding data lines.";}else if(limit!==null){var lines=before.split("\\n");if(lines.length>limit&&!(limit===0&&before==="")){var clipped=lines.slice(0,limit).join("\\n");var pos=Math.min(box.selectionStart||0,clipped.length);box.value=clipped;try{box.setSelectionRange(pos,pos);}catch(e){}err.textContent="Extra input lines were removed because the limit is "+limit+" lines.";}}updateInputUI(false);parent.postMessage({__nativeInputDraft:true,input:box.value},"*");}' +
+        'box.addEventListener("input",function(){clampInput();});' +
+        'box.addEventListener("keydown",function(e){if((e.ctrlKey||e.metaKey)&&e.key==="Enter"){e.preventDefault();form.requestSubmit();return;}if(e.key==="Enter"){var limit=getLineLimit(box.value);if(limitMode==="dynamic"&&limit===null){e.preventDefault();err.textContent="Enter a non-negative whole-number count on the first line before adding data lines.";return;}if(limit!==null&&lineCount(box.value)>=limit){e.preventDefault();err.textContent="Input limit reached ("+limit+" lines). Enter is disabled until you remove or edit a line.";return;}}});' +
+        'form.addEventListener("submit",function(e){e.preventDefault();clampInput();var val=box.value;var actual=lineCount(val);var limit=getLineLimit(val);err.textContent="";if(limitMode==="dynamic"&&limit===null){err.textContent="For variable input, the first line must be a non-negative whole number N (up to 100000).";return;}if(limit!==null&&actual!==limit){err.textContent="Input incomplete: expected exactly "+limit+" line(s), but received "+actual+". Add the missing line(s) before running.";return;}parent.postMessage({__nativeRunWithInput:true,input:val},"*");});' +
+        'clampInput();'
+      : 'form.addEventListener("submit",function(e){e.preventDefault();var val=box.value;err.textContent="";parent.postMessage({__nativeRunWithInput:true,input:val},"*");});';
+
+    const inputPanelHtml = isSqlPage
+      ? '<section class="inputbox"><strong>SQLite workspace</strong><p class="hint">SQL statements run locally. Tables and data remain in this in-memory database while the editor page stays open.</p></section>'
+      : '<form class="inputbox" id="stdinForm"><label for="stdinText">Program input' + inputLabel + '</label><textarea id="stdinText" spellcheck="false" placeholder="' + escapeHTML(inputPlaceholder) + '">' + escapeHTML(savedInputValue) + '</textarea><div class="hint" id="inputHint">' + escapeHTML(inputHint) + '</div>' + (isPythonPage ? '<div class="hint" id="inputStats">Input lines: ' + initialLineCount + ' · Characters: ' + savedInputValue.length + '</div>' : '') + '<button type="submit">▶ Run with Input</button><p id="inputError" class="hint" role="alert"></p></form>';
+    const footnote = isPythonPage
+      ? 'Python runs locally in your browser using Pyodide/WebAssembly. The first run downloads the runtime; later runs avoid remote compiler queues. Input is supplied before execution; this is not a fully live interactive terminal.'
+      : isSqlPage
+        ? 'SQL runs locally using SQLite compiled to WebAssembly. This is SQLite SQL, not a connection to an external database server.'
+        : isTypeScriptPage
+          ? 'TypeScript is compiled in the browser and executed in an isolated worker. Batch prompt() input is supported; Node.js APIs and package imports are not built in.'
+          : 'Native-language execution is provided by the external Judge0 service. Input is supplied before execution (batch mode).';
+    const page = '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{box-sizing:border-box}body{margin:0;padding:22px;background:#f1f5f9;color:#0f172a;font:14px/1.55 system-ui,Arial,sans-serif}main{max-width:900px;margin:0 auto}.head{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:14px}.head h2{margin:0;font-size:20px}.state{border-radius:999px;padding:4px 9px;background:#dbeafe;color:#1d4ed8;font-size:12px;font-weight:750}.out{margin:0;min-height:150px;max-height:45vh;overflow:auto;padding:16px;border-radius:10px;background:#0b1020;color:#e5e7eb;white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 Consolas,Monaco,monospace;box-shadow:0 6px 18px #0f172a22}.out.python-out{color:#60a5fa}.inputbox{margin:16px 0;padding:14px;background:#fff;border:1px solid #cbd5e1;border-radius:10px}.inputbox label{display:block;font-weight:750;margin-bottom:6px}.inputbox textarea{width:100%;min-height:90px;resize:vertical;padding:10px;border:1px solid #94a3b8;border-radius:7px;font:13px/1.5 Consolas,monospace}.inputbox button{margin-top:8px;background:#15803d;color:white;border:0;border-radius:7px;padding:10px 14px;font-weight:700;cursor:pointer}.hint,.details{color:#475569;font-size:12px;margin-top:8px}.foot{margin-top:12px;color:#64748b;font-size:11px}</style></head><body><main><div class="head"><h2>' + escapeHTML(language) + ' · Program Output</h2><span class="state">' + escapeHTML(state) + '</span></div><pre class="out' + (isPythonPage ? ' python-out' : '') + '">' + escapeHTML(content) + '</pre>' + inputPanelHtml + (details ? '<p class="details">' + escapeHTML(details) + '</p>' : '') + '<p class="foot">' + escapeHTML(footnote) + '</p></main><script>var form=document.getElementById("stdinForm"),box=document.getElementById("stdinText"),err=document.getElementById("inputError"),hint=document.getElementById("inputHint"),stats=document.getElementById("inputStats");' + (isSqlPage ? '' : inputLimitScript) + '<\/script></body></html>';
+    preview.srcdoc = page;
+    const label = document.getElementById('previewEntryLabel');
+    if (label) label.textContent = language + ' · Program output';
+  }
+
+  async function getJudgeLanguage(mode) {
+    if (!judgeLanguageListPromise) {
+      judgeLanguageListPromise = fetch('https://ce.judge0.com/languages/all', { headers: { 'Accept': 'application/json' } })
+        .then(async response => {
+          if (!response.ok) throw new Error('Could not load compiler languages (HTTP ' + response.status + ').');
+          const data = await response.json();
+          if (!Array.isArray(data)) throw new Error('The compiler service returned an unexpected language list.');
+          return data;
+        })
+        .catch(error => { judgeLanguageListPromise = null; throw error; });
+    }
+    const languages = await judgeLanguageListPromise;
+    const rules = {
+      python: name => /^python\b/i.test(name),
+      java: name => /^java\s*\(/i.test(name),
+      c: name => /^c\s*\(/i.test(name),
+      cpp: name => /^c\+\+\s*\(/i.test(name),
+      csharp: name => /^c#\s*\(/i.test(name) || /^csharp\s*\(/i.test(name),
+      php: name => /^php\b/i.test(name),
+      ruby: name => /^ruby\b/i.test(name),
+      swift: name => /^swift\b/i.test(name),
+      kotlin: name => /^kotlin\b/i.test(name),
+      rust: name => /^rust\b/i.test(name)
+    };
+    const candidates = languages.filter(item => !item.is_archived && item.name && rules[mode] && rules[mode](item.name));
+    candidates.sort((a,b) => Number(b.id) - Number(a.id));
+    if (!candidates.length) throw new Error('No active ' + languageNameForMode(mode) + ' compiler was found on the execution service.');
+    return candidates[0];
+  }
+
+  // Browser-local Python runtime (Pyodide/WebAssembly). Python no longer waits for
+  // a remote compiler queue; the first use downloads the runtime, later runs reuse it.
+  let localPythonWorker = null;
+  let localPythonWorkerReadyPromise = null;
+  let localPythonLoaded = false;       // Pyodide is loaded in this tab, so Python runs offline
+  let localPythonWorkerReadyTimer = null;
+  let localPythonMessageId = 0;
+  const localPythonPendingRuns = new Map();
+
+  function resetLocalPythonWorker(reason) {
+    if (localPythonWorkerReadyTimer !== null) clearTimeout(localPythonWorkerReadyTimer);
+    localPythonWorkerReadyTimer = null;
+    const worker = localPythonWorker;
+    localPythonWorker = null;
+    localPythonWorkerReadyPromise = null;
+    localPythonLoaded = false;
+    if (worker) {
+      worker.onmessage = null;
+      worker.onerror = null;
+      try { worker.terminate(); } catch (_) {}
+    }
+    for (const [id, job] of localPythonPendingRuns) {
+      localPythonPendingRuns.delete(id);
+      try { job.reject(reason instanceof Error ? reason : new Error(String(reason || 'Python worker stopped.'))); } catch (_) {}
+    }
+  }
+
+  function ensureLocalPythonRuntime() {
+    if (localPythonWorker && localPythonWorkerReadyPromise) return localPythonWorkerReadyPromise;
+
+    const workerSource = String.raw`let pyodidePromise = (async () => {
+  importScripts('https://cdn.jsdelivr.net/pyodide/v0.28.2/full/pyodide.js');
+  const py = await loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.28.2/full/' });
+  self.postMessage({ type: 'ready' });
+  return py;
+})();
+self.onmessage = async function(event) {
+  const msg = event.data || {};
+  if (msg.type !== 'run') return;
+  const out = [];
+  const err = [];
+  let py;
+  let setupComplete = false;
+  let programError = '';
+  try {
+    py = await pyodidePromise;
+    // Pass stdin as raw text instead of counting or rebuilding lines. This avoids
+    // accidental input-line restrictions and preserves blank/trailing lines exactly.
+    const inputText = typeof msg.inputText === 'string'
+      ? msg.inputText.replace(/\r\n?/g, '\n')
+      : (Array.isArray(msg.inputLines) ? msg.inputLines.map(function(v) { return String(v); }).join('\n') + (msg.inputLines.length ? '\n' : '') : '');
+    py.globals.set('__editor_stdin_text', inputText);
+    py.setStdout({ batched: function(value) { out.push(String(value)); } });
+    py.setStderr({ batched: function(value) { err.push(String(value)); } });
+    if (typeof py.loadPackagesFromImports === 'function') {
+      await py.loadPackagesFromImports(msg.code);
+    }
+    // Patch builtins.input using the same StringIO stream as sys.stdin. This is
+    // reliable for repeated input() calls inside loops (matrix rows, test cases, etc.).
+    await py.runPythonAsync('import builtins, io, sys\n__editor_saved_input = builtins.input\n__editor_saved_stdin = sys.stdin\nsys.stdin = io.StringIO(__editor_stdin_text)\ndef __editor_input(prompt=""):\n    if prompt:\n        sys.stdout.write(str(prompt))\n        sys.stdout.flush()\n    line = sys.stdin.readline()\n    if line == "":\n        raise EOFError("EOF when reading a line")\n    return line[:-1] if line.endswith("\\n") else line\nbuiltins.input = __editor_input');
+    setupComplete = true;
+    try {
+      await py.runPythonAsync(msg.code);
+    } catch (error) {
+      // Only errors raised by the user's code are reported as Python runtime errors.
+      programError = String(error && error.stack ? error.stack : error);
+    } finally {
+      // Restore the original Python input function and stdin without converting a
+      // successful program into a false runtime error if cleanup itself fails.
+      if (setupComplete) {
+        try {
+          await py.runPythonAsync('import builtins, sys\nbuiltins.input = __editor_saved_input\nsys.stdin = __editor_saved_stdin\n__editor_saved_input = None\n__editor_saved_stdin = None\n__editor_input = None\n__editor_stdin_text = None');
+        } catch (cleanupError) {
+          if (programError) programError += '\\nInput cleanup warning: ' + String(cleanupError);
+        }
+      }
+    }
+    self.postMessage({ type: 'result', id: msg.id, stdout: out.join('\n'), stderr: err.join('\n'), error: programError, status: programError ? 'Runtime Error' : 'Finished' });
+  } catch (error) {
+    self.postMessage({ type: 'result', id: msg.id, stdout: out.join('\n'), stderr: err.join('\n'), error: String(error && error.stack ? error.stack : error), status: 'Runtime Error' });
+  }
+};
+pyodidePromise.catch(function(error) { self.postMessage({ type: 'bootError', error: String(error && error.stack ? error.stack : error) }); });`;
+
+    let worker;
+    try {
+      const blob = new Blob([workerSource], { type: 'text/javascript' });
+      const url = URL.createObjectURL(blob);
+      worker = new Worker(url);
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      return Promise.reject(new Error('Could not start the local Python worker: ' + (error && error.message ? error.message : error)));
+    }
+
+    localPythonWorker = worker;
+    let resolveReady;
+    let rejectReady;
+    let readySettled = false;
+    localPythonWorkerReadyPromise = new Promise((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+
+    localPythonWorkerReadyTimer = setTimeout(() => {
+      if (readySettled || localPythonWorker !== worker) return;
+      readySettled = true;
+      const error = new Error('The local Python runtime did not load within 60 seconds. Check your internet connection and allow cdn.jsdelivr.net.');
+      rejectReady(error);
+      resetLocalPythonWorker(error);
+    }, 60000);
+
+    worker.onmessage = event => {
+      const message = event.data || {};
+      if (message.type === 'ready') {
+        if (!readySettled) {
+          readySettled = true;
+          if (localPythonWorkerReadyTimer !== null) clearTimeout(localPythonWorkerReadyTimer);
+          localPythonWorkerReadyTimer = null;
+          resolveReady(worker);
+          localPythonLoaded = true;
+          if (typeof updateRuntimeUi === 'function') updateRuntimeUi();
+        }
+        return;
+      }
+      if (message.type === 'bootError') {
+        const error = new Error('Could not load local Python (Pyodide): ' + message.error);
+        if (!readySettled) {
+          readySettled = true;
+          if (localPythonWorkerReadyTimer !== null) clearTimeout(localPythonWorkerReadyTimer);
+          localPythonWorkerReadyTimer = null;
+          rejectReady(error);
+        }
+        resetLocalPythonWorker(error);
+        return;
+      }
+      if (message.type === 'result') {
+        const job = localPythonPendingRuns.get(message.id);
+        if (job) {
+          localPythonPendingRuns.delete(message.id);
+          job.resolve(message);
+        }
+      }
+    };
+    worker.onerror = event => {
+      const error = new Error('Local Python worker failed: ' + (event.message || 'Unknown worker error.'));
+      if (!readySettled) {
+        readySettled = true;
+        if (localPythonWorkerReadyTimer !== null) clearTimeout(localPythonWorkerReadyTimer);
+        localPythonWorkerReadyTimer = null;
+        rejectReady(error);
+      }
+      resetLocalPythonWorker(error);
+    };
+    return localPythonWorkerReadyPromise;
+  }
+
+  async function executePythonLocally(source, stdin, runId) {
+    const startedAt = performance.now();
+    nativeOutputPage('Python', 'Starting local Python…', 'Preparing the browser-based Python runtime. The first load downloads Python once; later runs execute locally without an online compiler queue.');
+    status.textContent = 'Python · preparing local runtime…';
+    try {
+      const worker = await ensureLocalPythonRuntime();
+      if (runId !== nativeRunSequence) return;
+      // Keep the complete input text. There is no first-line count, per-line cap,
+      // or input-line truncation; loops may consume as many supplied lines as needed.
+      const inputText = String(stdin ?? '').replace(/\r\n?/g, '\n');
+      const id = ++localPythonMessageId;
+      const result = await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const error = new Error('Python run exceeded 30 seconds and was stopped to keep the editor responsive. Optimize the algorithm or reduce the input, then run again.');
+          resetLocalPythonWorker(error);
+          reject(error);
+        }, 30000);
+        localPythonPendingRuns.set(id, {
+          resolve: value => { clearTimeout(timer); resolve(value); },
+          reject: error => { clearTimeout(timer); reject(error); }
+        });
+        try {
+          worker.postMessage({ type: 'run', id, code: source, inputText });
+        } catch (error) {
+          clearTimeout(timer);
+          localPythonPendingRuns.delete(id);
+          reject(error);
+        }
+      });
+      if (runId !== nativeRunSequence) return;
+
+      const elapsed = ((performance.now() - startedAt) / 1000).toFixed(3);
+      const parts = [];
+      if (result.stdout !== '') parts.push('OUTPUT:\n' + result.stdout.replace(/\s+$/, ''));
+      if (result.stderr !== '') parts.push('STANDARD ERROR:\n' + result.stderr.replace(/\s+$/, ''));
+      if (result.error) parts.push('PYTHON ERROR:\n' + result.error);
+      const output = parts.length ? parts.join('\n\n') : (result.error ? 'Python execution failed.' : '(Program finished successfully with no printed output.)');
+      const state = result.error ? 'Runtime Error' : 'Finished';
+      nativeOutputPage('Python', state, output, 'Runtime: Local Python/WebAssembly · Time: ' + elapsed + ' s');
+      status.textContent = 'Python finished locally · ' + elapsed + ' s' + (result.error ? ' · Runtime error' : '');
+    } catch (error) {
+      if (runId !== nativeRunSequence) return;
+      const message = error && error.message ? error.message : String(error);
+      nativeOutputPage('Python', 'Local runtime error', 'Could not start or complete local Python execution.\n\n' + message + '\n\nThe first run needs internet access to download Pyodide from cdn.jsdelivr.net. Once loaded, normal runs stay in your browser.');
+      status.textContent = 'Python local run failed · ' + message;
+    }
+  }
+
+  // SQL and TypeScript run locally, without changing the execution paths for existing languages.
+  let sqlRuntimePromise = null;
+  let sqlDatabase = null;
+  let typeScriptRuntimePromise = null;
+
+  function loadScriptOnce(src, readyTest, globalLabel) {
+    if (readyTest()) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = src;
+      script.async = true;
+      script.onload = () => readyTest() ? resolve() : reject(new Error(globalLabel + ' loaded but did not expose its expected API.'));
+      script.onerror = () => reject(new Error('Could not download ' + globalLabel + '. Check your internet connection and try again.'));
+      document.head.appendChild(script);
+    });
+  }
+
+  async function ensureSqlDatabase() {
+    if (sqlDatabase) return sqlDatabase;
+    if (!sqlRuntimePromise) {
+      sqlRuntimePromise = loadScriptOnce(
+        'https://cdn.jsdelivr.net/npm/sql.js@1.15.1/dist/sql-wasm.js',
+        () => typeof window.initSqlJs === 'function',
+        'SQLite runtime'
+      ).then(() => window.initSqlJs({
+        locateFile: file => 'https://cdn.jsdelivr.net/npm/sql.js@1.15.1/dist/' + file
+      })).then(SQL => {
+        sqlDatabase = new SQL.Database();
+        return sqlDatabase;
+      }).catch(error => { sqlRuntimePromise = null; throw error; });
+    }
+    return sqlRuntimePromise;
+  }
+
+  function formatSqlResults(resultSets) {
+    if (!resultSets || !resultSets.length) return 'SQL statements executed successfully. No result set was returned.';
+    const blocks = [];
+    for (let index = 0; index < resultSets.length; index++) {
+      const result = resultSets[index];
+      const columns = (result.columns || []).map(v => String(v));
+      const rows = result.values || [];
+      const cell = value => value === null || value === undefined ? 'NULL' : String(value).replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+      const widths = columns.map((name, col) => { let width = name.length; for (const row of rows) width = Math.max(width, Math.min(36, cell(row[col]).length)); return Math.min(36, width); });
+      const line = values => values.map((value, col) => cell(value).slice(0, widths[col]).padEnd(widths[col])).join(' | ');
+      const divider = widths.map(width => '-'.repeat(width)).join('-+-');
+      let block = 'Result set ' + (index + 1) + ' (' + rows.length + ' row' + (rows.length === 1 ? '' : 's') + ')';
+      if (columns.length) {
+        block += '\n' + line(columns) + '\n' + divider;
+        block += rows.length ? '\n' + rows.map(row => line(row)).join('\n') : '\n(no rows)';
+      }
+      blocks.push(block);
+    }
+    return blocks.join('\n\n').slice(0, 60000);
+  }
+
+  async function executeSqlCode(source, runId) {
+    nativeOutputPage('SQL', 'Running locally…', 'Loading the SQLite runtime and executing your SQL statements…');
+    status.textContent = 'SQL · starting browser-local SQLite…';
+    try {
+      const db = await ensureSqlDatabase();
+      if (runId !== nativeRunSequence) return;
+      const startedAt = performance.now();
+      const results = db.exec(source);
+      if (runId !== nativeRunSequence) return;
+      const elapsed = ((performance.now() - startedAt) / 1000).toFixed(3);
+      const output = formatSqlResults(results);
+      nativeOutputPage('SQL', 'Executed successfully', output, 'SQLite/WebAssembly · ' + elapsed + ' s · In-memory database persists while this editor page stays open.');
+      status.textContent = 'SQL executed locally · ' + elapsed + ' s';
+    } catch (error) {
+      if (runId !== nativeRunSequence) return;
+      const message = error && error.message ? error.message : String(error);
+      nativeOutputPage('SQL', 'SQL error', 'SQLite reported an error:\n' + message + '\n\nCheck table names, column names, statement order, and SQL syntax.');
+      status.textContent = 'SQL error · ' + message;
+    }
+  }
+
+  async function ensureTypeScriptCompiler() {
+    if (window.ts && typeof window.ts.transpileModule === 'function') return window.ts;
+    if (!typeScriptRuntimePromise) {
+      typeScriptRuntimePromise = loadScriptOnce(
+        'https://cdn.jsdelivr.net/npm/typescript@6.0.2/lib/typescript.js',
+        () => !!(window.ts && typeof window.ts.transpileModule === 'function'),
+        'TypeScript compiler'
+      ).then(() => window.ts).catch(error => { typeScriptRuntimePromise = null; throw error; });
+    }
+    return typeScriptRuntimePromise;
+  }
+
+  function runTypeScriptInWorker(compiledCode, inputText, runId) {
+    return new Promise((resolve, reject) => {
+      const workerSource = `
+        let inputLines = [];
+        let inputIndex = 0;
+        const safeText = value => {
+          if (typeof value === 'string') return value;
+          if (value === undefined) return 'undefined';
+          if (typeof value === 'bigint') return String(value) + 'n';
+          try { const json = JSON.stringify(value); return json === undefined ? String(value) : json; }
+          catch (e) { return String(value); }
+        };
+        const sendConsole = (kind, args) => postMessage({type:'console', kind, text:Array.from(args).map(safeText).join(' ')});
+        self.console = {log:(...a)=>sendConsole('log',a),info:(...a)=>sendConsole('info',a),debug:(...a)=>sendConsole('debug',a),warn:(...a)=>sendConsole('warn',a),error:(...a)=>sendConsole('error',a),table:(v)=>sendConsole('log',[v]),clear:()=>postMessage({type:'clear'})};
+        self.prompt = label => { if (label) sendConsole('prompt',[label]); return inputIndex < inputLines.length ? inputLines[inputIndex++] : ''; };
+        self.alert = message => sendConsole('alert',[message]);
+        self.onmessage = event => {
+          inputLines = String(event.data.inputText || '').replace(/\\r\\n?/g,'\\n').split('\\n');
+          if (event.data.inputText === '') inputLines = [];
+          try {
+            const moduleBox = {exports:{}};
+            const requireShim = name => { throw new Error('TypeScript package import "' + name + '" is not available in the browser runner. Bundle dependencies first.'); };
+            const entry = new Function('exports','module','require', event.data.code);
+            const returned = entry(moduleBox.exports, moduleBox, requireShim);
+            Promise.resolve(returned).then(() => postMessage({type:'done'}), error => postMessage({type:'runtimeError', error:error && error.stack ? error.stack : String(error)}));
+          } catch (error) { postMessage({type:'runtimeError', error:error && error.stack ? error.stack : String(error)}); }
+        };
+      `;
+      let url = '';
+      let worker;
+      let done = false;
+      const finish = (err, value) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        try { if (worker) worker.terminate(); } catch (e) {}
+        if (url) URL.revokeObjectURL(url);
+        if (err) reject(err); else resolve(value);
+      };
+      const timer = setTimeout(() => finish(new Error('TypeScript program exceeded the 10-second execution limit. Check for an infinite loop.')), 10000);
+      try {
+        url = URL.createObjectURL(new Blob([workerSource], {type:'text/javascript'}));
+        worker = new Worker(url);
+        const logs = [];
+        worker.onmessage = event => {
+          if (runId !== nativeRunSequence) return finish(new Error('Run cancelled because a newer run started.'));
+          const data = event.data || {};
+          if (data.type === 'console') logs.push((data.kind === 'log' ? '' : '[' + data.kind.toUpperCase() + '] ') + data.text);
+          else if (data.type === 'clear') logs.length = 0;
+          else if (data.type === 'runtimeError') finish(null, {logs, error:data.error});
+          else if (data.type === 'done') finish(null, {logs, error:''});
+        };
+        worker.onerror = event => finish(new Error(event.message || 'TypeScript worker failed.'));
+        worker.postMessage({code:compiledCode, inputText:String(inputText || '')});
+      } catch (error) { finish(error); }
+    });
+  }
+
+  async function executeTypeScriptCode(source, inputText, runId) {
+    nativeOutputPage('TypeScript', 'Compiling…', 'Loading the TypeScript compiler and preparing your code…');
+    status.textContent = 'TypeScript · compiling in browser…';
+    try {
+      const ts = await ensureTypeScriptCompiler();
+      if (runId !== nativeRunSequence) return;
+      const transpiled = ts.transpileModule(source, {
+        reportDiagnostics: true,
+        compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.React, strict: false, esModuleInterop: true, sourceMap: false }
+      });
+      const errors = (transpiled.diagnostics || []).filter(d => d.category === ts.DiagnosticCategory.Error);
+      if (errors.length) {
+        const report = errors.map(d => {
+          const where = d.file && d.start != null ? d.file.getLineAndCharacterOfPosition(d.start) : null;
+          const location = where ? 'Line ' + (where.line + 1) + ', column ' + (where.character + 1) + ': ' : '';
+          return location + 'TS' + d.code + ': ' + ts.flattenDiagnosticMessageText(d.messageText, '\n');
+        }).join('\n');
+        nativeOutputPage('TypeScript', 'Compile error', report);
+        status.textContent = 'TypeScript compile error · ' + errors.length + ' diagnostic(s)';
+        return;
+      }
+      if (runId !== nativeRunSequence) return;
+      const startedAt = performance.now();
+      const result = await runTypeScriptInWorker(transpiled.outputText, inputText, runId);
+      if (runId !== nativeRunSequence) return;
+      const elapsed = ((performance.now() - startedAt) / 1000).toFixed(3);
+      const pieces = [];
+      if (result.logs.length) pieces.push('OUTPUT:\n' + result.logs.join('\n'));
+      if (result.error) pieces.push('RUNTIME ERROR:\n' + result.error);
+      const output = pieces.length ? pieces.join('\n\n') : (result.error ? 'TypeScript execution failed.' : '(Program finished successfully with no console output.)');
+      nativeOutputPage('TypeScript', result.error ? 'Runtime error' : 'Finished', output, 'TypeScript compiler in browser · isolated worker · ' + elapsed + ' s. Package imports and Node.js APIs are not built in.');
+      status.textContent = 'TypeScript ' + (result.error ? 'failed' : 'finished') + ' · ' + elapsed + ' s';
+    } catch (error) {
+      if (runId !== nativeRunSequence) return;
+      const message = error && error.message ? error.message : String(error);
+      nativeOutputPage('TypeScript', 'Compiler/runtime unavailable', 'Could not run TypeScript locally.\n\n' + message + '\n\nThe first run needs internet access to load the TypeScript compiler from jsDelivr.');
+      status.textContent = 'TypeScript unavailable · ' + message;
+    }
+  }
+
+  async function executeNativeCode(inputOverride) {
+    const mode = modeOfPath(activePath);
+    if (!isNativeLanguageMode(mode)) { run(); return; }
+    const runNow = runAvailability(mode);
+    if (!runNow.ok) { run(); return; }   // shows "Connection required to run" (or why not)
+    saveActiveEditorToProject();
+    const language = languageNameForMode(mode);
+    const source = editor.value;
+    const pythonInputCount = mode === 'python' ? countPythonInputCalls(source) : 0;
+    const pythonDynamicInput = mode === 'python' && pythonHasInputCallInsideLoop(source);
+    nativeExpectedInputCount = mode === 'python' ? (pythonDynamicInput ? null : pythonInputCount) : null;
+    nativePythonUsesDynamicInput = mode === 'python' && pythonDynamicInput;
+    if (!source.trim()) {
+      nativeOutputPage(language, 'No code', 'Write some code first, then click Run / Check Code.');
+      status.textContent = language + ' · Nothing to run yet.';
+      return;
+    }
+    const runId = ++nativeRunSequence;
+    const topStdinInput = document.getElementById('stdinInput');
+    const bufferedInput = mode === 'python'
+      ? nativePythonInputBuffer
+      : (mode === 'typescript' ? nativeTypeScriptInputBuffer : (nativeProgramInputBuffers[mode] || ''));
+    const stdin = typeof inputOverride === 'string' ? inputOverride : ((topStdinInput && topStdinInput.value) || bufferedInput || '');
+    if (typeof inputOverride === 'string' && topStdinInput) topStdinInput.value = inputOverride;
+    if (mode === 'python') nativePythonInputBuffer = stdin;
+    if (mode === 'typescript') nativeTypeScriptInputBuffer = stdin;
+    else if (mode !== 'python' && mode !== 'sql') nativeProgramInputBuffers[mode] = stdin;
+
+    // If Python uses input() and no values were supplied, show the input panel
+    // instead of sending an empty stdin to Judge0 (which causes EOFError).
+    if (mode === 'python' && pythonInputCount > 0 && stdin === '') {
+      nativeOutputPage(language, 'Input required', 'Your Python program uses input(). Enter the requested value in the Program input box below, then click Run with Input.\n\nExample code:\na = input()\nprint(a)');
+      status.textContent = 'Python · Enter input in the output page, then click Run with Input.';
+      return;
+    }
+
+    if (mode === 'python') {
+      const inputValidationError = validatePythonInputText(source, stdin);
+      if (inputValidationError) {
+        nativeOutputPage(language, 'Input required', inputValidationError);
+        status.textContent = 'Python · ' + inputValidationError;
+        return;
+      }
+    }
+
+    // Python runs locally in WebAssembly to avoid a remote submission/polling delay.
+    if (mode === 'python') {
+      await executePythonLocally(source, stdin, runId);
+      return;
+    }
+    if (mode === 'sql') {
+      await executeSqlCode(source, runId);
+      return;
+    }
+    if (mode === 'typescript') {
+      await executeTypeScriptCode(source, stdin, runId);
+      return;
+    }
+
+    if (!navigator.onLine) {
+      nativeOutputPage(language, 'Needs internet', language + ' runs on the online Judge0 compiler, so running it needs an internet connection.\n\nEditing, syncing with your team and saving all keep working offline. Your changes merge automatically when you reconnect.');
+      status.textContent = language + ' · running needs internet (editing works offline).';
+      return;
+    }
+    nativeOutputPage(language, 'Running…', 'Connecting to the online compiler and running your program…');
+    status.textContent = 'Running ' + language + ' on the online compiler…';
+    try {
+      const selectedLanguage = await getJudgeLanguage(mode);
+      if (runId !== nativeRunSequence) return;
+      const submitResponse = await fetch('https://ce.judge0.com/submissions?base64_encoded=false&wait=false', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+          language_id: selectedLanguage.id,
+          source_code: source,
+          stdin,
+          // Python gets an extended execution budget for algorithmic/longer solutions.
+          // Judge0's public CE caps custom requests at 15s CPU, 20s wall, and 256000 KB memory.
+          cpu_time_limit: mode === 'python' ? 15 : 2,
+          cpu_extra_time: mode === 'python' ? 2 : 0.5,
+          wall_time_limit: mode === 'python' ? 20 : 6,
+          memory_limit: mode === 'python' ? 256000 : 128000,
+          stack_limit: mode === 'python' ? 128000 : 64000,
+          max_file_size: mode === 'python' ? 4096 : 1024,
+          max_processes_and_or_threads: mode === 'python' ? 120 : 60,
+          enable_network: false
+        })
+      });
+      const submitData = await submitResponse.json().catch(() => ({}));
+      if (!submitResponse.ok) throw new Error(submitData.error || submitData.message || ('Submission failed (HTTP ' + submitResponse.status + ').'));
+      if (runId !== nativeRunSequence) return;
+      let result = submitData;
+      if (submitData.token) {
+        result = null;
+        for (let attempt = 0; attempt < 70; attempt++) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          if (runId !== nativeRunSequence) return;
+          const pollResponse = await fetch('https://ce.judge0.com/submissions/' + encodeURIComponent(submitData.token) + '?base64_encoded=false&fields=stdout,stderr,compile_output,message,status,time,memory,token');
+          const pollData = await pollResponse.json().catch(() => ({}));
+          if (!pollResponse.ok) throw new Error(pollData.error || pollData.message || ('Could not get run result (HTTP ' + pollResponse.status + ').'));
+          result = pollData;
+          if (pollData.status && Number(pollData.status.id) > 2) break;
+        }
+        if (!result || !result.status || Number(result.status.id) <= 2) throw new Error('The online compiler did not finish within 70 seconds. Your code may be queued or too expensive; optimize the algorithm and run again.');
+      }
+      if (runId !== nativeRunSequence) return;
+      const statusText = (result.status && result.status.description) || 'Finished';
+      const outputParts = [];
+      if (result.stdout) outputParts.push('OUTPUT:\n' + result.stdout.replace(/\s+$/, ''));
+      if (result.stderr) outputParts.push('ERROR OUTPUT:\n' + result.stderr.replace(/\s+$/, ''));
+      if (result.compile_output) outputParts.push('COMPILER OUTPUT:\n' + result.compile_output.replace(/\s+$/, ''));
+      if (result.message) outputParts.push('MESSAGE:\n' + result.message);
+      let output = outputParts.join('\n\n');
+      if (!output) output = statusText === 'Accepted' ? '(Program finished successfully with no printed output.)' : 'No standard output was returned.';
+      if (mode === 'python') {
+        const pythonStatusHelp = {
+          'Time Limit Exceeded': 'PYTHON EXECUTION LIMIT\nThe program exceeded the extended CPU/wall-time budget. Improve the algorithm (for example, avoid repeated nested loops), reduce repeated work, or process the input more efficiently.',
+          'Memory Limit Exceeded': 'PYTHON MEMORY LIMIT\nThe program used more memory than the execution service allows. Use generators/iterators, process data in chunks, and avoid storing unnecessary copies.',
+          'Runtime Error (NZEC)': 'PYTHON RUNTIME ERROR\nCheck the traceback above. Common causes include invalid input, index errors, division by zero, and calling int() on non-numeric text.',
+          'Compilation Error': 'PYTHON SOURCE ERROR\nReview the error details above. Check indentation, parentheses, quotes, and spelling.'
+        }[statusText];
+        if (pythonStatusHelp) output += '\n\n' + pythonStatusHelp;
+      }
+      const meta = [];
+      meta.push('Compiler: ' + selectedLanguage.name);
+      if (result.time != null) meta.push('Time: ' + result.time + ' s');
+      if (result.memory != null) meta.push('Memory: ' + result.memory + ' KB');
+      nativeOutputPage(language, statusText, output, meta.join(' · '));
+      status.textContent = language + ' run finished · ' + statusText + (result.time != null ? ' · ' + result.time + ' s' : '');
+    } catch (error) {
+      if (runId !== nativeRunSequence) return;
+      const message = error && error.message ? error.message : String(error);
+      nativeOutputPage(language, 'Execution failed', 'Could not run the code online.\n\n' + message + '\n\nCheck your internet connection and allow access to ce.judge0.com. The editor can still check syntax and preview HTML/CSS/JavaScript locally.');
+      status.textContent = language + ' run failed · ' + message;
+    }
+  }
+
+  function run() {
+    saveActiveEditorToProject();
+    const activeMode = modeOfPath(activePath);
+    const previewLabel = document.getElementById('previewEntryLabel');
+    if (isNativeLanguageMode(activeMode)) {
+      const issues = findModeDiagnostics(editor.value, activeMode);
+      const lang = languageNameForMode(activeMode);
+      const runNow = runAvailability(activeMode);
+      if (!runNow.ok) {
+        if (previewLabel) previewLabel.textContent = lang + ' · ' + runNow.chip;
+        nativeOutputPage(lang, runNow.chip, runNow.detail + '\n\nEditing, saving on this device and syncing with your team keep working.' + (issues.length ? '\n\nCommon issue detected in the editor:\n' + issues[0].message : ''));
+        status.textContent = lang + ' · ' + runNow.chip + '. Editing and saving keep working.';
+        return;
+      }
+      if (previewLabel) previewLabel.textContent = lang + ' · ready to run';
+      if (issues.length) {
+        nativeOutputPage(lang, 'Ready to run', 'Common issue detected in the editor:\n' + issues[0].message + '\n\nClick Run / Check Code to compile and run the current code.');
+        status.textContent = lang + ' checks · ' + issues.length + ' possible issue' + (issues.length === 1 ? '' : 's') + ': ' + issues[0].message;
+      } else {
+        nativeOutputPage(lang, 'Ready to run', 'Click Run / Check Code to compile and run this file.\n\nFor programs that read input, enter it in the Program input box in the output pane.');
+        status.textContent = lang + ' checks · no obvious syntax issues detected. Click Run / Check Code to see the program output.';
+      }
+      return;
+    }
+
+    setOutputPanelMode('browser');
+    let previewPath = activePath;
+    if (!isHtmlPath(previewPath)) {
+      if (projectFiles.has('index.html')) previewPath = 'index.html';
+      else previewPath = Array.from(projectFiles.keys()).find(isHtmlPath) || activePath;
+    }
+    const previewRecord = projectFiles.get(previewPath);
+    const source = (previewRecord && isHtmlPath(previewPath)) ? (previewPath === activePath ? editor.value : (previewRecord.content || '')) : editor.value;
+    const activeIssues = (activeMode === 'css' || activeMode === 'js') ? findModeDiagnostics(editor.value, activeMode) : [];
+    const htmlIssues = isHtmlPath(previewPath) ? findDiagnostics(source) : [];
+    const issues = [...activeIssues, ...htmlIssues].sort((a,b) => a.start - b.start);
+    if (previewLabel) previewLabel.textContent = 'Browser output · ' + (previewPath || 'no HTML entry');
+
+    const removals = [...findInvalidElementRanges(source)].sort((a, b) => a.start - b.start || b.end - a.end);
+    const merged = [];
+    for (const range of removals) {
+      const previous = merged[merged.length - 1];
+      if (previous && range.start <= previous.end) previous.end = Math.max(previous.end, range.end);
+      else merged.push({ ...range });
+    }
+    let previewSource = source;
+    if (!/^\s*<!doctype/i.test(previewSource)) previewSource = '<!DOCTYPE html>\n' + previewSource;
+    for (const range of merged.sort((a, b) => b.start - a.start)) {
+      previewSource = previewSource.slice(0, range.start) + previewSource.slice(range.end);
+    }
+    if (isHtmlPath(previewPath)) {
+      previewSource = assembleProjectPreview(previewSource, previewPath);
+      // Keep the HTML/CSS/JavaScript preview clean: do not inject the floating black console box.
+    }
+    for (const [name, dataUrl] of mediaMap) {
+      for (const variant of new Set([name, encodeURI(name)])) {
+        previewSource = previewSource.split('"' + variant + '"').join('"' + dataUrl + '"')
+                                     .split("'" + variant + "'").join("'" + dataUrl + "'");
+      }
+    }
+    previewSource += '\n<script>addEventListener("message",function(e){if(e.data==="__print_preview__")print();});<\/script>';
+    preview.srcdoc = previewSource;
+
+    if (activeIssues.length) {
+      status.textContent = languageNameForMode(activeMode) + ' checks · ' + activeIssues.length + ' issue' + (activeIssues.length === 1 ? '' : 's') + ' in ' + activePath + ': ' + activeIssues[0].message;
+    } else if (htmlIssues.length) {
+      status.textContent = 'Preview updated · ' + htmlIssues.length + ' HTML issue' + (htmlIssues.length === 1 ? '' : 's') + ': ' + htmlIssues[0].message;
+    } else {
+      status.textContent = 'Preview updated · no obvious syntax issues detected.';
+    }
+  }
+
+
+  // Lightweight VS Code-style IntelliSense: HTML tags, attributes, values,
+  // common Emmet-like abbreviations, and a full HTML document template.
+  const popup = document.getElementById('completionPopup');
+  let completions = [];
+  let activeCompletion = 0;
+  let replaceFrom = 0;
+  let replaceTo = 0;
+  let completionMode = '';
+
+
+  const tagNames = [
+    'a','abbr','address','area','article','aside','audio','b','base','blockquote',
+    'body','br','button','canvas','caption','code','col','colgroup','data','datalist',
+    'dd','del','details','dfn','dialog','div','dl','dt','em','embed','fieldset','figcaption',
+    'figure','footer','form','h1','h2','h3','h4','h5','h6','head','header','hr','html',
+    'i','iframe','img','input','ins','label','legend','li','link','main','map','mark','meta',
+    'nav','noscript','object','ol','optgroup','option','output','p','param','picture','pre',
+    'progress','q','rp','rt','ruby','s','samp','script','section','select','small','source',
+    'span','strong','style','sub','summary','sup','table','tbody','td','template','textarea',
+    'tfoot','th','thead','time','title','tr','track','u','ul','var','video','wbr'
+  ];
+
+  const attrNames = [
+    'accept','action','alt','aria-label','autocomplete','autofocus','checked','charset',
+    'class','cols','colspan','content','controls','data-*','defer','disabled','download',
+    'for','height','hidden','href','id','loading','max','maxlength','method','min','multiple',
+    'name','onclick','onchange','oninput','placeholder','poster','readonly','rel','required',
+    'role','rows','rowspan','selected','src','srcset','step','style','tabindex','target',
+    'title','type','value','width'
+  ];
+
+  const abbreviations = [
+    {label:'html', detail:'HTML5 document template', type:'snippet'},
+    {label:'div', detail:'Division container', type:'tag'},
+    {label:'span', detail:'Inline container', type:'tag'},
+    {label:'p', detail:'Paragraph', type:'tag'},
+    {label:'h1', detail:'Main heading', type:'tag'},
+    {label:'h2', detail:'Section heading', type:'tag'},
+    {label:'h3', detail:'Subheading', type:'tag'},
+    {label:'a', detail:'Link', type:'tag'},
+    {label:'img', detail:'Image element', type:'tag'},
+    {label:'button', detail:'Button element', type:'tag'},
+    {label:'ul', detail:'Unordered list', type:'tag'},
+    {label:'ol', detail:'Ordered list', type:'tag'},
+    {label:'li', detail:'List item', type:'tag'},
+    {label:'input', detail:'Form input', type:'tag'},
+    {label:'form', detail:'Form element', type:'tag'},
+    {label:'header', detail:'Page header', type:'tag'},
+    {label:'footer', detail:'Page footer', type:'tag'},
+    {label:'main', detail:'Main content', type:'tag'},
+    {label:'section', detail:'Page section', type:'tag'},
+    {label:'nav', detail:'Navigation', type:'tag'},
+    {label:'table', detail:'Table element', type:'tag'},
+    {label:'script', detail:'JavaScript block', type:'tag'},
+    {label:'style', detail:'CSS block', type:'tag'}
+  ];
+
+  const valueSuggestions = {
+    type: ['text','password','email','number','checkbox','radio','submit','button','date','file','search','url','tel','color','range','reset'],
+    target: ['_blank','_self','_parent','_top'],
+    rel: ['noopener','noreferrer','nofollow','stylesheet','icon'],
+    method: ['get','post'],
+    loading: ['lazy','eager'],
+    autocomplete: ['on','off'],
+    display: ['block','inline','inline-block','flex','grid','none'],
+    position: ['static','relative','absolute','fixed','sticky'],
+    'text-align': ['left','center','right','justify'],
+    color: ['black','white','red','blue','green','transparent'],
+    'background-color': ['black','white','red','blue','green','transparent']
+  };
+
+  // Basic HTML5 starter template (inserted by the Boilerplate button, or by typing ! then Tab).
+  const BOILERPLATE = [
+    '<!DOCTYPE html>',
+    '<html lang="en">',
+    '<head>',
+    '  <meta charset="UTF-8">',
+    '  <meta name="viewport" content="width=device-width, initial-scale=1.0">',
+    '  <title>Document</title>',
+    '</head>',
+    '<body>',
+    '  ',
+    '</body>',
+    '</html>',
+    ''
+  ].join('\n');
+  const BOILERPLATE_CURSOR = BOILERPLATE.indexOf('<body>\n') + '<body>\n  '.length;
+
+  function makeSuggestion(label, detail, kind, insert, cursorOffset, from, to) {
+    return { label, detail, kind, insert, cursorOffset, from, to };
+  }
+
+  const cssProperties = [
+    'accent-color','align-content','align-items','align-self','animation',
+    'appearance','aspect-ratio','background','background-attachment',
+    'background-clip','background-color','background-image','background-position',
+    'background-repeat','background-size','border','border-bottom','border-color',
+    'border-radius','border-style','border-width','bottom','box-shadow','box-sizing',
+    'color','column-gap','columns','cursor','display','filter','flex','flex-basis',
+    'flex-direction','flex-grow','flex-shrink','flex-wrap','float','font',
+    'font-family','font-size','font-style','font-weight','gap','grid',
+    'grid-template-columns','grid-template-rows','height','inset','justify-content',
+    'left','letter-spacing','line-height','list-style','margin','margin-bottom',
+    'margin-left','margin-right','margin-top','max-height','max-width','min-height',
+    'min-width','object-fit','opacity','order','outline','overflow','overflow-wrap',
+    'padding','padding-bottom','padding-left','padding-right','padding-top',
+    'place-content','place-items','pointer-events','position','right','row-gap',
+    'text-align','text-decoration','text-overflow','text-transform','top','transform',
+    'transition','user-select','vertical-align','visibility','white-space','width',
+    'word-break','z-index'
+  ];
+
+  const cssValueSuggestions = {
+    color: ['black','white','red','green','blue','yellow','orange','purple','gray','grey','pink','transparent','currentColor','inherit','initial','unset','#000000','#ffffff','#2563eb','#16a34a'],
+    'background-color': ['black','white','red','green','blue','yellow','orange','purple','gray','transparent','inherit','initial','unset','#000000','#ffffff','#f3f4f6','#111827','#2563eb'],
+    background: ['black','white','transparent','none','inherit','linear-gradient()','url()'],
+    display: ['block','inline','inline-block','flex','grid','inline-flex','inline-grid','none'],
+    position: ['static','relative','absolute','fixed','sticky'],
+    'text-align': ['left','center','right','justify','start','end'],
+    'font-weight': ['normal','bold','bolder','lighter','400','500','600','700'],
+    'font-style': ['normal','italic','oblique'],
+    'font-size': ['12px','14px','16px','18px','1rem','1.2rem','2rem'],
+    'flex-direction': ['row','row-reverse','column','column-reverse'],
+    'flex-wrap': ['nowrap','wrap','wrap-reverse'],
+    'justify-content': ['start','end','center','space-between','space-around','space-evenly','flex-start','flex-end'],
+    'align-items': ['stretch','start','end','center','baseline','flex-start','flex-end'],
+    overflow: ['visible','hidden','clip','scroll','auto'],
+    cursor: ['auto','default','pointer','wait','text','move','not-allowed'],
+    'object-fit': ['fill','contain','cover','none','scale-down'],
+    'box-sizing': ['content-box','border-box'],
+    'text-decoration': ['none','underline','overline','line-through'],
+    visibility: ['visible','hidden','collapse']
+  };
+
+  function cssContext(before) {
+    // Enable CSS IntelliSense when editing a standalone .css tab.
+    if (modeOfPath(activePath) === 'css') return { text: before, inline: false, standalone: true };
+    // CSS within a style="..." attribute where the quote is still open.
+    const inline = before.match(/\bstyle\s*=\s*"([^"]*)$/i) ||
+                   before.match(/\bstyle\s*=\s*'([^']*)$/i);
+    if (inline) return { text: inline[1], inline: true };
+
+    // CSS within the content of a <style> block, not in its opening/closing tag.
+    const lower = before.toLowerCase();
+    const styleStart = lower.lastIndexOf('<style');
+    const styleEnd = styleStart >= 0 ? before.indexOf('>', styleStart) : -1;
+    const closeStyle = lower.lastIndexOf('</style');
+    if (styleStart >= 0 && styleEnd > styleStart && styleEnd < before.length && styleStart > closeStyle) {
+      return { text: before.slice(styleEnd + 1), inline: false };
+    }
+    return null;
+  }
+
+  function getCssCompletions(context, pos) {
+    const text = context.text;
+    const boundary = Math.max(text.lastIndexOf('{'), text.lastIndexOf(';'), text.lastIndexOf('}'));
+    const segment = text.slice(boundary + 1);
+    const colon = segment.lastIndexOf(':');
+
+    // After "property:" offer possible values, e.g. display: fle -> flex.
+    if (colon >= 0) {
+      const property = segment.slice(0, colon).trim().toLowerCase();
+      const rawValue = segment.slice(colon + 1);
+      const valueMatch = rawValue.match(/[^\s;{}]*$/);
+      const prefix = valueMatch ? valueMatch[0] : '';
+      const known = cssValueSuggestions[property] || [];
+      const common = ['auto','inherit','initial','unset','none','normal','0','100%'];
+      const options = Array.from(new Set([...known, ...common]));
+      return options
+        .filter(value => !prefix || value.toLowerCase().startsWith(prefix.toLowerCase()))
+        .map(value => makeSuggestion(value, 'CSS value for ' + property, 'value', value, value.length, pos - prefix.length, pos))
+        .slice(0, 35);
+    }
+
+    // Before ":" offer property names, e.g. col -> color, column-gap, columns.
+    const propertyMatch = segment.match(/^\s*([a-z-]*)$/i);
+    if (!propertyMatch) return [];
+    const prefix = propertyMatch[1];
+    const inRule = text.lastIndexOf('{') > text.lastIndexOf('}');
+    if (!context.inline && !inRule) return [];
+    return cssProperties
+      .filter(property => property.startsWith(prefix.toLowerCase()))
+      .map(property => makeSuggestion(property, 'CSS property', 'css', property + ': ', property.length + 2, pos - prefix.length, pos))
+      .slice(0, 40);
+  }
+
+  // JavaScript IntelliSense inside <script> blocks. Suggestions are selectable
+  // (not auto-inserted): use ArrowUp/ArrowDown, Enter/Tab, or click an item.
+  const jsMembers = {
+    console: ['log','info','warn','error','debug','table','dir','trace','time','timeEnd','clear','assert','group','groupEnd','count','countReset'],
+    document: ['getElementById','getElementsByClassName','getElementsByTagName','querySelector','querySelectorAll','createElement','createTextNode','createDocumentFragment','addEventListener','removeEventListener','write','body','head','title','documentElement','forms','images','links','readyState'],
+    window: ['alert','confirm','prompt','print','open','close','focus','blur','setTimeout','setInterval','clearTimeout','clearInterval','addEventListener','removeEventListener','requestAnimationFrame','cancelAnimationFrame','location','history','localStorage','sessionStorage','innerWidth','innerHeight','scrollTo','scrollBy'],
+    Math: ['abs','ceil','floor','max','min','pow','random','round','sqrt','trunc','sign','log','log10','sin','cos','tan','PI','E'],
+    JSON: ['parse','stringify'],
+    Array: ['isArray','from','of'],
+    String: ['fromCharCode','fromCodePoint','raw'],
+    Number: ['isNaN','isFinite','parseInt','parseFloat','isInteger','MAX_VALUE','MIN_VALUE'],
+    Object: ['keys','values','entries','assign','freeze','create','defineProperty','hasOwn','fromEntries'],
+    Date: ['now','parse','UTC'],
+    Promise: ['resolve','reject','all','allSettled','race','any'],
+    localStorage: ['getItem','setItem','removeItem','clear','key','length'],
+    sessionStorage: ['getItem','setItem','removeItem','clear','key','length'],
+    fetch: ['then','catch','finally'],
+    event: ['preventDefault','stopPropagation','stopImmediatePropagation','target','currentTarget','type','key','keyCode'],
+    consoleElement: ['textContent','innerHTML','innerText','value','classList','style','appendChild','remove','addEventListener','focus','blur','click','setAttribute','getAttribute']
+  };
+
+  const jsKeywords = [
+    'async','await','break','case','catch','class','const','continue','debugger',
+    'default','delete','do','else','export','extends','false','finally','for',
+    'from','function','if','import','in','instanceof','let','new','null','of',
+    'return','static','super','switch','this','throw','true','try','typeof',
+    'undefined','var','void','while','yield','console','document','window','Math',
+    'JSON','Array','String','Number','Object','Date','Promise','fetch','alert',
+    'parseInt','parseFloat','isNaN','isFinite','setTimeout','setInterval',
+    'clearTimeout','clearInterval','requestAnimationFrame','localStorage',
+    'sessionStorage','event','Error','Map','Set','WeakMap','WeakSet','RegExp',
+    'Intl','URL','URLSearchParams','Blob','FormData','Headers','Response','Request',
+    'undefined','NaN','Infinity','globalThis','this'
+  ];
+
+  const jsSnippets = [
+    { label: 'clg', detail: 'console.log() statement', insert: 'console.log();', cursorOffset: 12 },
+    { label: 'log', detail: 'console.log() statement', insert: 'console.log();', cursorOffset: 12 },
+    { label: 'fn', detail: 'Function declaration template', insert: 'function name() {\n  \n}', cursorOffset: 9 },
+    { label: 'af', detail: 'Arrow function template', insert: 'const name = (params) => {\n  \n};', cursorOffset: 6 },
+    { label: 'if', detail: 'If statement template', insert: 'if (condition) {\n  \n}', cursorOffset: 4 },
+    { label: 'ife', detail: 'If / else template', insert: 'if (condition) {\n  \n} else {\n  \n}', cursorOffset: 4 },
+    { label: 'for', detail: 'For loop template', insert: 'for (let i = 0; i < length; i++) {\n  \n}', cursorOffset: 9 },
+    { label: 'forof', detail: 'for...of loop template', insert: 'for (const item of items) {\n  \n}', cursorOffset: 15 },
+    { label: 'foreach', detail: 'forEach callback template', insert: 'items.forEach((item) => {\n  \n});', cursorOffset: 'items.forEach((item) => {\n  '.length },
+    { label: 'timeout', detail: 'setTimeout callback template', insert: 'setTimeout(() => {\n  \n}, 1000);', cursorOffset: 'setTimeout(() => {\n  '.length },
+    { label: 'addevent', detail: 'addEventListener template', insert: 'element.addEventListener("click", (event) => {\n  \n});', cursorOffset: 'element.addEventListener("click", (event) => {\n  '.length },
+    { label: 'trycatch', detail: 'try / catch error-handling template', insert: 'try {\n  \n} catch (error) {\n  console.error(error);\n}', cursorOffset: 7 },
+    { label: 'promise', detail: 'Promise template', insert: 'new Promise((resolve, reject) => {\n  \n});', cursorOffset: 'new Promise((resolve, reject) => {\n  '.length },
+    { label: 'fetch', detail: 'Fetch request template', insert: 'fetch(url)\n  .then(response => response.json())\n  .then(data => {\n    \n  })\n  .catch(error => console.error(error));', cursorOffset: 'fetch(url)\n  .then(response => response.json())\n  .then(data => {\n    '.length }
+  ];
+
+  function inJavaScriptBlock(before, pos) {
+    if (modeOfPath(activePath) === 'js') return true;
+    const lower = before.toLowerCase();
+    const open = lower.lastIndexOf('<script');
+    if (open < 0) return false;
+    const openEnd = lower.indexOf('>', open);
+    const close = lower.lastIndexOf('<\/script');
+    return openEnd >= 0 && openEnd < pos && open > close;
+  }
+
+  function isInsideJavaScriptComment(before) {
+    // Scan the current script prefix so URL strings containing // do not
+    // accidentally disable IntelliSense. This intentionally lightweight scan
+    // understands quoted strings, template literals, line comments and blocks.
+    let quote = '';
+    let lineComment = false;
+    let blockComment = false;
+    let escaped = false;
+    for (let i = 0; i < before.length; i++) {
+      const ch = before[i];
+      const next = before[i + 1];
+      if (lineComment) {
+        if (ch === '\n') lineComment = false;
+        continue;
+      }
+      if (blockComment) {
+        if (ch === '*' && next === '/') { blockComment = false; i++; }
+        continue;
+      }
+      if (quote) {
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (ch === quote) quote = '';
+        continue;
+      }
+      if (ch === '/' && next === '/') { lineComment = true; i++; continue; }
+      if (ch === '/' && next === '*') { blockComment = true; i++; continue; }
+      if (ch === '"' || ch === "'" || ch === '`') quote = ch;
+    }
+    return lineComment || blockComment;
+  }
+
+  function getJavaScriptCompletions(before, pos) {
+    // Work only with the JavaScript body, not preceding HTML/CSS markup.
+    // Keep absolute caret positions for replacing the current token.
+    const standaloneJs = ['js','mjs','cjs'].includes(extensionOf(activePath));
+    const lowerSource = before.toLowerCase();
+    const scriptStart = lowerSource.lastIndexOf('<script');
+    const scriptClose = lowerSource.lastIndexOf('<\/script');
+    const scriptOpenEnd = scriptStart >= 0 ? before.indexOf('>', scriptStart) : -1;
+    const jsBefore = !standaloneJs && scriptStart > scriptClose && scriptOpenEnd >= 0
+      ? before.slice(scriptOpenEnd + 1)
+      : before;
+    if (isInsideJavaScriptComment(jsBefore)) return [];
+
+    // Object/member suggestions, e.g. console.l -> log or document.getEle -> getElementById.
+    const memberMatch = jsBefore.match(/\b([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)?$/);
+    if (memberMatch) {
+      const objectName = memberMatch[1];
+      const prefix = memberMatch[2] || '';
+      const from = pos - prefix.length;
+      let candidates = jsMembers[objectName] || [];
+
+      // Basic variable-type inference for common arrays and strings.
+      if (!candidates.length) {
+        const escapedName = objectName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const declaration = new RegExp('\\b(?:const|let|var)\\s+' + escapedName + '\\s*=\\s*([^;\\n]+)').exec(jsBefore);
+        const initializer = declaration ? declaration[1].trim() : '';
+        if (/^(?:\[|new\s+Array\b)/.test(initializer)) {
+          candidates = ['map','filter','reduce','forEach','find','findIndex','some','every','includes','indexOf','slice','splice','push','pop','shift','unshift','concat','join','sort','reverse','length','at','flat','flatMap'];
+        } else if (/^(?:["'`]|new\s+String\b)/.test(initializer)) {
+          candidates = ['length','charAt','charCodeAt','includes','indexOf','lastIndexOf','slice','substring','substr','split','replace','replaceAll','toLowerCase','toUpperCase','trim','trimStart','trimEnd','startsWith','endsWith','match','matchAll','padStart','padEnd','repeat','concat'];
+        } else {
+          candidates = ['length','toString','valueOf','hasOwnProperty'];
+        }
+      }
+      return candidates
+        .filter(name => name.toLowerCase().startsWith(prefix.toLowerCase()))
+        .map(name => makeSuggestion(name, objectName + ' member', 'js', name, name.length, from, pos))
+        .slice(0, 35);
+    }
+
+    const tokenMatch = jsBefore.match(/[A-Za-z_$][\w$]*$/);
+    if (!tokenMatch) return [];
+    const prefix = tokenMatch[0];
+    const from = pos - prefix.length;
+
+    // Small useful snippets similar to VS Code snippets. Accept with Enter/Tab;
+    // they are suggestions only and never replace what is being typed by themselves.
+    const snippetMatches = jsSnippets.filter(item => item.label.startsWith(prefix.toLowerCase()));
+    const wordMatches = jsKeywords
+      .filter(word => word.toLowerCase().startsWith(prefix.toLowerCase()))
+      .map(word => makeSuggestion(word, 'JavaScript keyword / built-in', 'js', word, word.length, from, pos));
+
+    // Suggest variable and function names already declared before the caret.
+    const declaredNames = [];
+    const declarations = /\b(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)/g;
+    let declaration;
+    while ((declaration = declarations.exec(jsBefore)) !== null) declaredNames.push(declaration[1]);
+    const localMatches = Array.from(new Set(declaredNames))
+      .filter(name => name.toLowerCase().startsWith(prefix.toLowerCase()))
+      .map(name => makeSuggestion(name, 'Declared in this code', 'js', name, name.length, from, pos));
+
+    const snippets = snippetMatches.map(item => makeSuggestion(
+      item.label,
+      item.detail,
+      'snippet',
+      item.insert,
+      item.cursorOffset,
+      from,
+      pos
+    ));
+
+    const combined = [...snippets, ...wordMatches, ...localMatches];
+    const seen = new Set();
+    return combined.filter(item => {
+      const key = item.label.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, 35);
+  }
+
+  function getLanguageCompletions(before, pos, mode) {
+    const prefixMatch = before.match(/[A-Za-z_$][\w$]*$/);
+    if (!prefixMatch) return [];
+    const prefix = prefixMatch[0];
+    const from = pos - prefix.length;
+    const words = [...(languageKeywords[mode] || []), ...(languageBuiltins[mode] || [])];
+    const wordMatches = Array.from(new Set(words))
+      .filter(word => word.toLowerCase().startsWith(prefix.toLowerCase()))
+      .map(word => makeSuggestion(word, languageNameForMode(mode) + ' keyword / built-in', 'js', word, word.length, from, pos));
+    const snippets = (languageSnippets[mode] || [])
+      .filter(item => item.label.toLowerCase().startsWith(prefix.toLowerCase()))
+      .map(item => makeSuggestion(item.label, item.detail, 'snippet', item.insert, item.cursorOffset, from, pos));
+    const seen = new Set();
+    return [...snippets, ...wordMatches].filter(item => {
+      const key = item.label.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, 35);
+  }
+
+  function getCompletions() {
+    const pos = editor.selectionStart;
+    if (pos !== editor.selectionEnd) return [];
+    const before = editor.value.slice(0, pos);
+    const fileMode = modeOfPath(activePath);
+    if (['python','java','c','cpp','csharp','php','ruby','swift','kotlin','rust','typescript','sql'].includes(fileMode)) {
+      return getLanguageCompletions(before, pos, fileMode);
+    }
+
+    // Offer comment completion as a selectable IntelliSense item rather than
+    // inserting it automatically. Press Enter/Tab or click the suggestion.
+    if (before.endsWith('<!-') && !isInsideHtmlComment(editor.value, pos)) {
+      const from = pos - 3;
+      return [makeSuggestion(
+        'HTML comment <\!-- -->',
+        'Insert an HTML comment and place the cursor inside it',
+        'snippet',
+        '<\!--  -->',
+        5,
+        from,
+        pos
+      )];
+    }
+
+    const lineStart = before.lastIndexOf('\n') + 1;
+    const linePrefix = before.slice(lineStart);
+    // Emmet-style shortcut: type ! (or html5 / boilerplate) on an empty line, then Enter/Tab.
+    if (/^\s*(!|html5?|boiler\w*|basic\w*|template)$/i.test(linePrefix) && !inJavaScriptBlock(before, pos)) {
+      return [makeSuggestion(
+        'HTML5 boilerplate',
+        'Insert a basic HTML template (doctype, head, body)',
+        'snippet',
+        BOILERPLATE,
+        BOILERPLATE_CURSOR,
+        lineStart + linePrefix.search(/\S/),
+        pos
+      )];
+    }
+
+    const currentTagStart = before.lastIndexOf('<');
+    const lastClose = before.lastIndexOf('>');
+    const inTag = currentTagStart > lastClose;
+
+    // Do not offer HTML suggestions from inside an HTML comment.
+    const commentStart = before.lastIndexOf('<\!--');
+    const commentEnd = before.lastIndexOf('-->');
+    if (commentStart > commentEnd) return [];
+
+    // Inside <script>/<style> the only HTML worth suggesting is the matching
+    // closing tag, so typing "</" there must reach the tag completer below.
+    const inScript = inJavaScriptBlock(before, pos);
+    const context = inScript ? null : cssContext(before);
+    const rawBlock = inScript ? 'script' : (context && !context.inline ? 'style' : '');
+    const closingRawTag = rawBlock && /<\/[A-Za-z]*$/.test(before);
+
+    // JavaScript suggestions are only active inside a <script> block.
+    // (Checked before CSS so a JS string like el.style = "..." is not read as CSS.)
+    if (inScript && !closingRawTag) {
+      return getJavaScriptCompletions(before, pos);
+    }
+
+    // CSS IntelliSense, including inside inline style attributes.
+    if (context && !closingRawTag) return getCssCompletions(context, pos);
+
+    if (inTag) {
+      const partial = before.slice(currentTagStart);
+      const closingTag = /^<\/[A-Za-z\w:-]*$/.test(partial);
+      const openPrefix = partial.match(/^<([A-Za-z][\w:-]*)?$/);
+      if (closingTag || openPrefix) {
+        const prefix = closingTag ? partial.slice(2) : (openPrefix[1] || '');
+        const from = pos - prefix.length;
+        return tagNames
+          .filter(tag => !closingRawTag || tag === rawBlock)
+          .filter(tag => tag.toLowerCase().startsWith(prefix.toLowerCase()))
+          .slice(0, 50)
+          .map(tag => {
+            if (closingTag) {
+              return makeSuggestion(tag, 'Closing HTML tag', 'tag', tag + '>', tag.length + 1, from, pos);
+            }
+            const insert = '<' + tag + '>' + (voidTags.has(tag) ? '' : '</' + tag + '>');
+            return makeSuggestion(tag, voidTags.has(tag) ? 'HTML void element' : 'HTML element with closing tag', 'tag', insert, tag.length + 2, currentTagStart, pos);
+          });
+      }
+
+      const opening = partial.match(/^<([A-Za-z][\w:-]*)([\s\S]*)$/);
+      if (opening) {
+        const rest = opening[2];
+        const inQuotedValue = rest.match(/([\w:-]+)\s*=\s*(["'])([^"']*)$/);
+        if (inQuotedValue) {
+          const attr = inQuotedValue[1].toLowerCase();
+          const prefix = inQuotedValue[3];
+          const values = valueSuggestions[attr] || [];
+          return values.filter(v => v.toLowerCase().startsWith(prefix.toLowerCase())).map(v =>
+            makeSuggestion(v, 'Attribute value', 'value', v, v.length, pos - prefix.length, pos)
+          );
+        }
+        if (/\s/.test(rest)) {
+          const attrMatch = rest.match(/(?:^|\s)([A-Za-z_:][\w:.-]*)?$/);
+          if (attrMatch) {
+            const prefix = attrMatch[1] || '';
+            const from = pos - prefix.length;
+            return attrNames.filter(a => a.toLowerCase().startsWith(prefix.toLowerCase())).map(a => {
+              const insertion = a === 'data-*' ? 'data-' : a + '=""';
+              const offset = a === 'data-*' ? insertion.length : a.length + 2;
+              return makeSuggestion(a, 'HTML attribute', 'attr', insertion, offset, from, pos);
+            });
+          }
+        }
+      }
+      return [];
+    }
+
+    // Offer a full HTML template by typing ! or html at the start of a blank document.
+    const trimmedBefore = before.trim();
+    const wordMatch = linePrefix.match(/[A-Za-z!][\w!-]*$/);
+    if (wordMatch) {
+      const word = wordMatch[0];
+      const from = pos - word.length;
+      const onlyWhitespaceBeforeLine = linePrefix.slice(0, linePrefix.length - word.length).trim() === '';
+      if (onlyWhitespaceBeforeLine && (word === '!' || 'html'.startsWith(word.toLowerCase())) && (trimmedBefore === word || editor.value.trim() === word)) {
+        const template = '<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1.0">\n  <title>Document</title>\n</head>\n<body>\n  \n</body>\n</html>';
+        return [makeSuggestion('HTML5 Boilerplate', 'Generate a complete HTML document', 'snippet', template, template.indexOf('  \n') + 3, from, pos)];
+      }
+
+      const matches = abbreviations.filter(item => item.label.startsWith(word.toLowerCase()));
+      if (matches.length) {
+        return matches.slice(0, 30).map(item => {
+          let insert = '<' + item.label + '>' + (voidTags.has(item.label) ? '' : '</' + item.label + '>');
+          let offset = item.label.length + 2;
+          if (item.label === 'html') {
+            const template = '<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="UTF-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1.0">\n  <title>Document</title>\n</head>\n<body>\n  \n</body>\n</html>';
+            insert = template;
+            offset = template.indexOf('  \n') + 3;
+          }
+          return makeSuggestion(item.label, item.detail, item.type, insert, offset, from, pos);
+        });
+      }
+    }
+
+    return [];
+  }
+
+  function renderCompletions() {
+    completions = getCompletions();
+    activeCompletion = 0;
+    if (!completions.length || document.activeElement !== editor) {
+      hideCompletions();
+      return;
+    }
+    popup.innerHTML = '';
+    completions.forEach((item, index) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'completion-item' + (index === activeCompletion ? ' active' : '');
+      button.setAttribute('role', 'option');
+      button.innerHTML = '<span class="completion-kind">' + escapeHTML(item.kind === 'tag' ? '<>' : item.kind === 'attr' ? 'A' : item.kind === 'css' ? '{ }' : item.kind === 'snippet' ? '✦' : item.kind === 'js' ? 'JS' : item.kind === 'value' ? 'V' : 'V') + '</span><span class="completion-copy"><span class="completion-label">' + escapeHTML(item.label) + '</span><span class="completion-detail">' + escapeHTML(item.detail) + '</span></span>';
+      button.addEventListener('mousedown', event => {
+        event.preventDefault();
+        acceptCompletion(index);
+      });
+      popup.appendChild(button);
+    });
+    const hint = document.createElement('div');
+    hint.className = 'completion-hint';
+    hint.textContent = '↑ ↓ navigate   Enter / Tab accept   Esc close';
+    popup.appendChild(hint);
+    popup.style.display = 'block';
+    positionPopup();
+  }
+
+  function positionPopup() {
+    const area = editor.parentElement;
+    const before = editor.value.slice(0, editor.selectionStart);
+    const rows = before.split('\n');
+    const row = rows.length - 1;
+    const colText = rows[rows.length - 1];
+    const styles = getComputedStyle(editor);
+    const canvas = positionPopup.canvas || (positionPopup.canvas = document.createElement('canvas'));
+    const context = canvas.getContext('2d');
+    context.font = styles.fontSize + ' ' + styles.fontFamily;
+    const left = 15 + context.measureText(colText).width - editor.scrollLeft;
+    const lineHeight = parseFloat(styles.lineHeight) || 21.45;
+    let top = 15 + (row + 1) * lineHeight - editor.scrollTop;
+    const popHeight = Math.min(230, popup.scrollHeight || 180);
+    if (top + popHeight > area.clientHeight) top = Math.max(4, top - popHeight - lineHeight);
+    const maxLeft = Math.max(4, area.clientWidth - Math.min(300, area.clientWidth - 12) - 4);
+    popup.style.left = Math.max(4, Math.min(left, maxLeft)) + 'px';
+    popup.style.top = Math.max(4, Math.min(top, area.clientHeight - 40)) + 'px';
+  }
+
+  function hideCompletions() {
+    popup.style.display = 'none';
+    completions = [];
+    activeCompletion = 0;
+  }
+
+  function setActiveCompletion(index) {
+    if (!completions.length) return;
+    activeCompletion = (index + completions.length) % completions.length;
+    popup.querySelectorAll('.completion-item').forEach((item, i) => {
+      item.classList.toggle('active', i === activeCompletion);
+    });
+    const selected = popup.querySelectorAll('.completion-item')[activeCompletion];
+    if (selected) selected.scrollIntoView({ block: 'nearest' });
+  }
+
+  function acceptCompletion(index = activeCompletion) {
+    const item = completions[index];
+    if (!item) return;
+    const start = item.from;
+    const end = item.to;
+    editor.setRangeText(item.insert, start, end, 'select');
+    const caret = start + (item.cursorOffset ?? item.insert.length);
+    editor.setSelectionRange(caret, caret);
+    hideCompletions();
+    editor.focus();
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+    status.textContent = 'Inserted ' + item.label + '.';
+  }
+
+  const voidTags = new Set(['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr','keygen','basefont','frame','isindex']);
+
+  // Lightweight diagnostics, similar to an editor's red error squiggles.
+  // This is not a full HTML/CSS language server, but it catches common mistakes.
+  const knownTags = new Set([
+    ...tagNames,
+    'acronym','applet','basefont','bgsound','big','center','command','content','dir',
+    'font','frame','frameset','image','isindex','keygen','listing','marquee','menuitem',
+    'multicol','nextid','noembed','noframes','param','plaintext','rb','rtc','shadow',
+    'strike','tt','xmp',
+    'svg','path','circle','ellipse','rect','line','polyline','polygon','g','defs','use',
+    'symbol','clippath','lineargradient','radialgradient','stop','text','tspan','textpath',
+    'mask','pattern','filter','feGaussianBlur'.toLowerCase(),'foreignobject','marker',
+    'math','mrow','mi','mn','mo','msup','msub','msubsup','mfrac','msqrt','mroot','mtable',
+    'mtr','mtd','annotation','semantics','menclose','mtext','mpadded','mspace',
+    'bdi','bdo','cite','kbd','menu','meter','slot','hgroup','search','desc','metadata','switch',
+    'animate','animatetransform','animatemotion','set','fedropshadow','fecolormatrix','feoffset',
+    'feflood','fecomposite','femerge','femergenode','feblend','image','mpath','view'
+  ]);
+  const optionalEndTags = new Set(['li','p','dt','dd','option','optgroup','tr','td','th','thead','tbody','tfoot','rt','rp']);
+  const cssPropertySet = new Set([
+    ...cssProperties,
+    'all','animation-delay','animation-direction','animation-duration','animation-fill-mode',
+    'animation-iteration-count','animation-name','animation-play-state','animation-timing-function',
+    'backdrop-filter','background-blend-mode','background-origin','border-block','border-block-color',
+    'border-bottom-left-radius','border-bottom-right-radius','border-image','border-inline',
+    'border-left','border-right','border-top','border-top-left-radius','border-top-right-radius',
+    'break-after','break-before','break-inside','caption-side','caret-color','clear','clip-path',
+    'color-scheme','contain','container','content','counter-increment','counter-reset','direction',
+    'empty-cells','filter','flex-flow','grid-area','grid-auto-columns','grid-auto-flow',
+    'grid-auto-rows','grid-column','grid-column-end','grid-column-gap','grid-column-start',
+    'grid-row','grid-row-end','grid-row-gap','grid-row-start','hyphens','image-rendering',
+    'isolation','justify-items','justify-self','list-style-image','list-style-position',
+    'max-block-size','max-inline-size','min-block-size','min-inline-size','object-position',
+    'outline-color','outline-offset','outline-style','outline-width','overflow-x','overflow-y',
+    'overscroll-behavior','perspective','perspective-origin','resize','scroll-behavior',
+    'scroll-margin','scroll-padding','table-layout','text-decoration-color','text-decoration-line',
+    'text-decoration-style','text-indent','text-shadow','text-wrap','touch-action','transform-origin',
+    'unicode-bidi','user-select','will-change','word-spacing','writing-mode','-webkit-line-clamp',
+    'transition-property','transition-duration','transition-delay','transition-timing-function','margin-inline','margin-inline-start','margin-inline-end','margin-block','margin-block-start','margin-block-end','padding-inline','padding-inline-start','padding-inline-end','padding-block','padding-block-start','padding-block-end','inset-inline','inset-block','border-collapse','border-spacing','border-top-color','border-top-style','border-top-width','border-right-color','border-right-style','border-right-width','border-bottom-color','border-bottom-style','border-bottom-width','border-left-color','border-left-style','border-left-width','border-inline-start','border-inline-end','list-style-type','text-underline-offset','text-decoration-thickness','text-align-last','text-transform','font-variant','font-stretch','font-feature-settings','font-display','font-optical-sizing','grid-template','grid-template-areas','grid-gap','place-self','scale','rotate','translate','clip','column-count','column-width','column-rule','column-span','fill','stroke','stroke-width','stroke-linecap','stroke-linejoin','stroke-dasharray','stroke-dashoffset','opacity','mask','mask-image','mask-size','mix-blend-mode','background-position-x','background-position-y','background-blend-mode','offset','overscroll-behavior-x','overscroll-behavior-y','scroll-snap-type','scroll-snap-align','scroll-margin-top','scroll-padding-top','inline-size','block-size','overflow-anchor','tab-size','quotes','page-break-before','page-break-after','page-break-inside','print-color-adjust','forced-color-adjust','aspect-ratio','accent-color','content-visibility','contain-intrinsic-size','zoom','cursor','src','unicode-range','size','margin-trim','text-emphasis','text-orientation','line-break','overflow-wrap','word-wrap','hanging-punctuation','shape-outside','shape-margin','backface-visibility','transform-style','transform-box','color-scheme','field-sizing','interpolate-size','anchor-name','position-anchor','view-transition-name','appearance','resize','caret-color','pointer-events','justify-content','align-content','align-self','justify-self','place-items','flex','flex-flow','order','float','clear','visibility','z-index','object-fit','object-position','outline-offset','border-image-source','border-image-slice','border-image-width','border-image-repeat','border-start-start-radius','border-end-end-radius','background-image','box-decoration-break','isolation','text-size-adjust','vertical-align','white-space-collapse','widows','orphans','speak','volume','math-style','initial-letter'
+  ]);
+
+  // Return true when a caret/position is inside an HTML comment. An unfinished
+  // comment is treated as a comment through the end of the current source.
+  function isInsideHtmlComment(source, position) {
+    const start = source.lastIndexOf('<\!--', position);
+    const end = source.lastIndexOf('-->', position);
+    return start !== -1 && start > end;
+  }
+
+  function findHtmlCommentRanges(source) {
+    const ranges = [];
+    let cursor = 0;
+    while (cursor < source.length) {
+      const start = source.indexOf('<\!--', cursor);
+      if (start < 0) break;
+      const close = source.indexOf('-->', start + 4);
+      const end = close < 0 ? source.length : close + 3;
+      ranges.push({ start, end });
+      cursor = end;
+    }
+    return ranges;
+  }
+
+  function findDiagnostics(source) {
+    const issues = [];
+    function add(start, end, message) {
+      if (end > start) issues.push({ start, end, message });
+    }
+    function findTagEnd(start) {
+      let quote = '';
+      for (let i = start; i < source.length; i++) {
+        const ch = source[i];
+        if (quote) {
+          if (ch === quote) quote = '';
+        } else if (ch === '"' || ch === "'") {
+          quote = ch;
+        } else if (ch === '>') {
+          return i;
+        }
+      }
+      return -1;
+    }
+    function checkLooseText(start, end, stack) {
+      const text = source.slice(start, end);
+      if (!text.trim()) return;
+
+      // Flag visible text that is not wrapped in a content element. Text directly
+      // inside <body> (or <html>/outside the document) is highlighted red. Text
+      // inside <p>, <div>, <h1>, <li>, etc. is valid and remains untouched.
+      const parent = stack.length ? stack[stack.length - 1].name : null;
+      const unwrapped = !parent || parent === 'html' || parent === 'body';
+      if (unwrapped) {
+        const leading = text.search(/\S/);
+        const trailing = text.search(/\s*$/);
+        const wordStart = start + Math.max(0, leading);
+        const wordEnd = start + (trailing < 0 ? text.length : trailing);
+        if (wordEnd > wordStart) {
+          add(wordStart, wordEnd, 'Unwrapped text. Put this text inside an HTML element such as <p>, <h1>, or <div>.');
+        }
+      }
+    }
+
+    const stack = [];
+    let cursor = 0;
+    while (cursor < source.length) {
+      const lt = source.indexOf('<', cursor);
+      if (lt < 0) {
+        checkLooseText(cursor, source.length, stack);
+        break;
+      }
+      checkLooseText(cursor, lt, stack);
+
+      if (source.startsWith('<\!--', lt)) {
+        const endComment = source.indexOf('-->', lt + 4);
+        cursor = endComment < 0 ? source.length : endComment + 3;
+        continue;
+      }
+      // While the user is typing the comment trigger <!-, wait for the
+      // suggestion to be accepted instead of treating the trigger as text/error.
+      if (source.startsWith('<!- ', lt) || source.startsWith('<!-', lt)) break;
+      if (/^<!DOCTYPE\b/i.test(source.slice(lt))) {
+        const docEnd = source.indexOf('>', lt + 2);
+        cursor = docEnd < 0 ? source.length : docEnd + 1;
+        continue;
+      }
+
+      const opening = source.slice(lt).match(/^<(\/)?\s*([A-Za-z][\w:-]*)\b/);
+      if (!opening) {
+        cursor = lt + 1;
+        continue;
+      }
+      const closeIndex = findTagEnd(lt + opening[0].length);
+      // While a user is still typing a tag, wait until it has a closing >.
+      if (closeIndex < 0) break;
+
+      const isClosing = Boolean(opening[1]);
+      const tag = opening[2].toLowerCase();
+      const nameStart = lt + opening[0].lastIndexOf(opening[2]);
+      const nameEnd = nameStart + opening[2].length;
+      const wholeTag = source.slice(lt, closeIndex + 1);
+      const customElement = tag.includes('-');
+      if (!knownTags.has(tag) && !customElement) {
+        add(nameStart, nameEnd, 'Unknown HTML tag <' + tag + '>. Check the spelling.');
+      }
+
+      if (isClosing) {
+        let index = -1;
+        for (let j = stack.length - 1; j >= 0; j--) {
+          if (stack[j].name === tag) { index = j; break; }
+        }
+        if (index < 0) {
+          add(nameStart, nameEnd, 'Unexpected closing tag </' + tag + '> with no matching opening tag.');
+        } else {
+          const intervening = stack.slice(index + 1);
+          if (intervening.some(item => !optionalEndTags.has(item.name))) {
+            add(nameStart, nameEnd, 'Closing tag </' + tag + '> does not match the most recently opened element.');
+          }
+          stack.splice(index);
+        }
+      } else {
+        // Optional-end tags are implicitly closed by a new sibling of the same type.
+        if (optionalEndTags.has(tag) && stack.length && stack[stack.length - 1].name === tag) stack.pop();
+        const selfClosing = /\/\s*>$/.test(wholeTag);
+        if (!selfClosing && !voidTags.has(tag)) {
+          stack.push({ name: tag, start: nameStart, end: nameEnd });
+        }
+      }
+
+      cursor = closeIndex + 1;
+      // Treat script and style bodies as raw text so JS operators or strings do not
+      // accidentally get interpreted as HTML tags by this lightweight checker.
+      if (!isClosing && (tag === 'script' || tag === 'style')) {
+        const closeRe = new RegExp('</\\s*' + tag + '\\s*>', 'ig');
+        closeRe.lastIndex = cursor;
+        const closeMatch = closeRe.exec(source);
+        if (closeMatch) {
+          cursor = closeMatch.index;
+        } else {
+          // A missing script/style closing tag is a common, useful diagnostic.
+          add(nameStart, nameEnd, 'Missing closing </' + tag + '> tag.');
+          cursor = source.length;
+        }
+      }
+    }
+
+    // Flag common misspelled CSS properties inside style blocks and style attributes.
+    function inspectCSS(css, absoluteOffset, inline) {
+      // Blank out comments (keeping offsets) so they are never read as CSS.
+      css = css.replace(/\/\*[\s\S]*?(?:\*\/|$)/g, m => ' '.repeat(m.length));
+      let depth = inline ? 1 : 0, segStart = 0, quote = '', paren = 0;
+      function flush(end, terminator) {
+        // Text before "{" is a selector or at-rule header, never a declaration.
+        if (terminator === '{' || depth <= 0) return;
+        const seg = css.slice(segStart, end);
+        const m = /^(\s*)(--[\w-]+|-?[A-Za-z][\w-]*)\s*:/.exec(seg);
+        if (!m) return;
+        const property = m[2], lower = property.toLowerCase();
+        if (lower.startsWith('-') || cssPropertySet.has(lower)) return;
+        const at = absoluteOffset + segStart + m[1].length;
+        add(at, at + property.length, 'Unknown CSS property "' + property + '". Check the spelling.');
+      }
+      for (let i = 0; i < css.length; i++) {
+        const ch = css[i];
+        if (quote) { if (ch === '\\') i++; else if (ch === quote) quote = ''; continue; }
+        if (ch === '"' || ch === "'") { quote = ch; continue; }
+        if (ch === '(') { paren++; continue; }
+        if (ch === ')') { paren = Math.max(0, paren - 1); continue; }
+        if (paren) continue;
+        if (ch === ';') { flush(i, ';'); segStart = i + 1; }
+        else if (ch === '{') { flush(i, '{'); depth++; segStart = i + 1; }
+        else if (ch === '}') { flush(i, '}'); depth = Math.max(0, depth - 1); segStart = i + 1; }
+      }
+      flush(css.length, '');
+    }
+    const styleBlocks = /<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi;
+    let block;
+    while ((block = styleBlocks.exec(source)) !== null) {
+      const bodyOffset = block.index + block[0].indexOf(block[1]);
+      inspectCSS(block[1], bodyOffset, false);
+    }
+    const inlineStyles = /\bstyle\s*=\s*(["'])([\s\S]*?)\1/gi;
+    let inline;
+    while ((inline = inlineStyles.exec(source)) !== null) {
+      const valueOffset = inline.index + inline[0].indexOf(inline[2]);
+      inspectCSS(inline[2], valueOffset, true);
+    }
+
+    // Never show error underlines inside HTML comments. This guard also protects
+    // comments typed in stages (including the completed <\!--  --> form) from
+    // false positives from tag, text, or CSS diagnostics.
+    const commentRanges = findHtmlCommentRanges(source);
+    const visibleIssues = issues.filter(issue =>
+      !commentRanges.some(range => issue.start < range.end && issue.end > range.start)
+    );
+
+    visibleIssues.sort((a, b) => a.start - b.start);
+    // Merge overlapping error spans so the red underline remains continuous.
+    const merged = [];
+    for (const issue of visibleIssues) {
+      const previous = merged[merged.length - 1];
+      if (previous && issue.start < previous.end) {
+        previous.end = Math.max(previous.end, issue.end);
+        if (!previous.message.includes(issue.message)) previous.message += ' ' + issue.message;
+      } else {
+        merged.push({ ...issue });
+      }
+    }
+    return merged;
+  }
+
+
+  function insertTextAtCursor(text, cursorOffset = text.length) {
+    const start = editor.selectionStart;
+    const end = editor.selectionEnd;
+    editor.setRangeText(text, start, end, 'end');
+    const cursor = start + cursorOffset;
+    editor.setSelectionRange(cursor, cursor);
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  // If the user has typed a partial tag such as <h1 and leaves the editor,
+  // complete it to <h1></h1> and put the cursor between the tags.
+  function completePartialTag() {
+    if (editor.selectionStart !== editor.selectionEnd) return;
+    const cursor = editor.selectionStart;
+    const before = editor.value.slice(0, cursor);
+    if (isInsideHtmlComment(editor.value, cursor)) return;
+    const partial = before.match(/<([A-Za-z][\w:-]*)$/);
+    if (!partial) return;
+
+    const tag = partial[1];
+    const ending = '>' + (voidTags.has(tag.toLowerCase()) ? '' : `</${tag}>`);
+    insertTextAtCursor(ending, 1);
+    status.textContent = voidTags.has(tag.toLowerCase())
+      ? `Completed <${tag}>.`
+      : `Completed <${tag}></${tag}>. Cursor is inside the element.`;
+  }
+
+  function maskPythonStringsAndComments(source) {
+    // Replace string/comment contents with spaces while preserving every newline
+    // and character offset. Triple-quoted blocks may span multiple lines.
+    let cleaned = '';
+    let i = 0;
+    let quote = null;
+    let triple = false;
+    let comment = false;
+    while (i < source.length) {
+      const ch = source[i];
+      const next3 = source.slice(i, i + 3);
+      if (comment) {
+        if (ch === '\n') { comment = false; cleaned += '\n'; }
+        else cleaned += ' ';
+        i++;
+        continue;
+      }
+      if (quote) {
+        if (ch === '\\') {
+          cleaned += ' ';
+          i++;
+          if (i < source.length) { cleaned += source[i] === '\n' ? '\n' : ' '; i++; }
+          continue;
+        }
+        if (triple && next3 === quote.repeat(3)) { cleaned += '   '; i += 3; quote = null; triple = false; continue; }
+        if (!triple && ch === quote) { cleaned += ' '; i++; quote = null; continue; }
+        cleaned += ch === '\n' ? '\n' : ' ';
+        i++;
+        continue;
+      }
+      if (ch === '#') { comment = true; cleaned += ' '; i++; continue; }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        triple = next3 === ch.repeat(3);
+        cleaned += triple ? '   ' : ' ';
+        i += triple ? 3 : 1;
+        continue;
+      }
+      cleaned += ch;
+      i++;
+    }
+    return cleaned;
+  }
+
+  function countPythonInputCalls(source) {
+    // Ignore comments, normal strings and multiline triple-quoted blocks.
+    const cleaned = maskPythonStringsAndComments(source);
+    return (cleaned.match(/\binput\s*\(/g) || []).length;
+  }
+
+  function pythonHasInputCallInsideLoop(source) {
+    // A static count is wrong when input() is executed repeatedly in a for/while
+    // loop (for example: read n, then read n matrix rows). In that case, allow
+    // a variable number of stdin lines rather than blocking valid submissions.
+    const cleaned = maskPythonStringsAndComments(source);
+    const lines = cleaned.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const match = lines[i].match(/^(\s*)(?:async\s+)?(?:for|while)\b.*?:\s*(.*)$/);
+      if (!match) continue;
+      if (/\binput\s*\(/.test(match[2] || '')) return true; // one-line loop body
+      const loopIndent = match[1].replace(/\t/g, '    ').length;
+      for (let j = i + 1; j < lines.length; j++) {
+        const line = lines[j];
+        if (!line.trim()) continue;
+        const indent = (line.match(/^\s*/) || [''])[0].replace(/\t/g, '    ').length;
+        if (indent <= loopIndent) break;
+        if (/\binput\s*\(/.test(line)) return true;
+      }
+    }
+    return false;
+  }
+
+  function validatePythonInputText(source, inputText) {
+    const cleanedInput = String(inputText ?? '').replace(/\r\n?/g, '\n');
+    const actualLines = cleanedInput === '' ? 0 : cleanedInput.split('\n').length;
+    const dynamic = pythonHasInputCallInsideLoop(source);
+    let expectedLines;
+    if (dynamic) {
+      const first = cleanedInput.split('\n', 1)[0].trim();
+      if (!/^(0|[1-9]\d*)$/.test(first)) {
+        return 'Variable-input mode requires a non-negative whole-number count on the first line (up to 100000).';
+      }
+      const n = Number(first);
+      if (!Number.isSafeInteger(n) || n > 100000) {
+        return 'The first-line input count must be between 0 and 100000.';
+      }
+      expectedLines = n + 1;
+    } else {
+      expectedLines = countPythonInputCalls(source);
+    }
+    if (actualLines < expectedLines) {
+      return 'Input incomplete: this program is configured for exactly ' + expectedLines + ' input line(s), but ' + actualLines + ' supplied. Add the missing line(s) and run again.';
+    }
+    if (actualLines > expectedLines) {
+      return 'Too many input lines: this program is configured for exactly ' + expectedLines + ' input line(s), but ' + actualLines + ' supplied. Remove the extra line(s) and run again.';
+    }
+    return '';
+  }
+
+  function pythonIsInsideTripleQuotedString(source, position = source.length) {
+    let quote = null;
+    let triple = false;
+    let escaped = false;
+    let comment = false;
+    for (let i = 0; i < Math.min(position, source.length); i++) {
+      const ch = source[i];
+      if (comment) { if (ch === '\n') comment = false; continue; }
+      if (quote) {
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (triple && source.startsWith(quote.repeat(3), i)) { quote = null; triple = false; i += 2; continue; }
+        if (!triple && ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '#') { comment = true; continue; }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        triple = source.startsWith(ch.repeat(3), i);
+        if (triple) i += 2;
+      }
+    }
+    return Boolean(quote && triple);
+  }
+
+  function refreshPythonInputRequirement() {
+    if (modeOfPath(activePath) !== 'python') return;
+    const source = editor.value || '';
+    const count = countPythonInputCalls(source);
+    const dynamicInput = pythonHasInputCallInsideLoop(source);
+    nativeExpectedInputCount = dynamicInput ? null : count;
+    nativePythonUsesDynamicInput = dynamicInput;
+    if (!source.trim()) {
+      nativeOutputPage('Python', 'No code', 'Write Python code, then click Run / Check Code to see its output.');
+      return;
+    }
+    // Keep the live input requirement inside the Program input panel, never in Program Output.
+    nativeOutputPage('Python', 'Input setup', 'Run your Python code to see the result here.');
+  }
+
+  // Python smart indentation helpers (four spaces per block, like common IDEs).
+  function pythonLineEndsWithBlockColon(line) {
+    let code = '';
+    let quote = '';
+    let triple = false;
+    let escaped = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (quote) {
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (triple && line.slice(i, i + 3) === quote.repeat(3)) { quote = ''; triple = false; i += 2; continue; }
+        if (!triple && ch === quote) quote = '';
+        continue;
+      }
+      if (ch === '#') break;
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        triple = line.slice(i, i + 3) === ch.repeat(3);
+        if (triple) i += 2;
+        continue;
+      }
+      code += ch;
+    }
+    return code.trimEnd().endsWith(':');
+  }
+
+  function pythonHasUnclosedBracket(source) {
+    const stack = [];
+    let quote = '';
+    let triple = false;
+    let escaped = false;
+    let comment = false;
+    for (let i = 0; i < source.length; i++) {
+      const ch = source[i];
+      if (comment) { if (ch === '\n') comment = false; continue; }
+      if (quote) {
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (triple && source.slice(i, i + 3) === quote.repeat(3)) { quote = ''; triple = false; i += 2; continue; }
+        if (!triple && ch === quote) quote = '';
+        continue;
+      }
+      if (ch === '#') { comment = true; continue; }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        triple = source.slice(i, i + 3) === ch.repeat(3);
+        if (triple) i += 2;
+        continue;
+      }
+      if (ch === '(' || ch === '[' || ch === '{') stack.push(ch);
+      else if (ch === ')' || ch === ']' || ch === '}') {
+        const expected = ch === ')' ? '(' : ch === ']' ? '[' : '{';
+        if (stack.length && stack[stack.length - 1] === expected) stack.pop();
+      }
+    }
+    return stack.length > 0;
+  }
+
+  function autoDedentPythonClause() {
+    if (modeOfPath(activePath) !== 'python' || editor.selectionStart !== editor.selectionEnd) return;
+    const value = editor.value;
+    const caret = editor.selectionStart;
+    const lineStart = value.lastIndexOf('\n', Math.max(0, caret - 1)) + 1;
+    const lineEndFound = value.indexOf('\n', caret);
+    const lineEnd = lineEndFound < 0 ? value.length : lineEndFound;
+    const line = value.slice(lineStart, lineEnd);
+    const match = line.match(/^([ \t]+)(?=(?:elif|else|except|finally|case)\b)/);
+    if (!match) return;
+    const indentation = match[1];
+    const newIndentation = indentation.startsWith('\t')
+      ? indentation.slice(1)
+      : indentation.slice(0, Math.max(0, indentation.length - 4));
+    const removed = indentation.length - newIndentation.length;
+    if (!removed) return;
+    editor.value = value.slice(0, lineStart) + newIndentation + value.slice(lineStart + indentation.length);
+    const nextCaret = Math.max(lineStart + newIndentation.length, caret - removed);
+    editor.setSelectionRange(nextCaret, nextCaret);
+  }
+
+  editor.addEventListener('input', () => {
+    autoDedentPythonClause();
+    nativeRunSequence++;
+    saveActiveEditorToProject();
+    updateEditor();
+    collabAfterLocalEdit();
+    // Avoid rendering the Python preview twice per keystroke: update its input
+    // count directly so the output page always reflects the latest source.
+    if (modeOfPath(activePath) === 'python') refreshPythonInputRequirement();
+    else run();
+    renderCompletions();
+  });
+  editor.addEventListener('click', renderCompletions);
+  editor.addEventListener('keyup', event => {
+    if (['ArrowUp','ArrowDown','Enter','Tab','Escape','Shift','Control','Alt','Meta'].includes(event.key)) return;
+    renderCompletions();
+  });
+  editor.addEventListener('scroll', () => { syncScroll(); if (popup.style.display === 'block') positionPopup(); });
+  editor.addEventListener('blur', () => {
+    hideCompletions();
+    completePartialTag();
+  });
+  editor.addEventListener('keydown', event => {
+    if (popup.style.display === 'block' && completions.length) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault(); setActiveCompletion(activeCompletion + 1); return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault(); setActiveCompletion(activeCompletion - 1); return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault(); hideCompletions(); return;
+      }
+      if (event.key === 'Enter' || event.key === 'Tab') {
+        event.preventDefault(); acceptCompletion(); return;
+      }
+    }
+    // Python: when the user types the third quote, make a paired triple-quoted
+    // block and keep the caret between the opening and closing delimiters.
+    // This is useful for multiline docstrings/comment-style blocks.
+    if ((event.key === '\'' || event.key === '\"') && modeOfPath(activePath) === 'python' &&
+        editor.selectionStart === editor.selectionEnd && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      const quote = event.key;
+      const value = editor.value;
+      const caret = editor.selectionStart;
+      const before = value.slice(0, caret);
+      const after = value.slice(caret);
+      const trailingQuotes = before.match(new RegExp(quote + '+$'));
+      if (trailingQuotes && trailingQuotes[0].length === 2 && !after.startsWith(quote)) {
+        event.preventDefault();
+        const start = caret - 2;
+        editor.setRangeText(quote.repeat(6), start, caret, 'end');
+        editor.setSelectionRange(start + 3, start + 3);
+        editor.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+      }
+    }
+
+    // Python: Backspace removes a whole indentation step when the caret is
+    // inside leading whitespace on an otherwise empty line.
+    if (event.key === 'Backspace' && modeOfPath(activePath) === 'python' && editor.selectionStart === editor.selectionEnd) {
+      const value = editor.value;
+      const caret = editor.selectionStart;
+      const lineStart = value.lastIndexOf('\n', Math.max(0, caret - 1)) + 1;
+      const linePrefix = value.slice(lineStart, caret);
+      if (linePrefix.length > 0 && /^[ \t]+$/.test(linePrefix)) {
+        event.preventDefault();
+        const removeCount = linePrefix.endsWith('    ') ? 4 : (linePrefix.endsWith('\t') ? 1 : Math.min(4, linePrefix.length));
+        editor.setRangeText('', caret - removeCount, caret, 'end');
+        editor.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+      }
+    }
+
+    // Python: press Enter to continue with smart indentation. A block header
+    // ending in ':' adds four spaces; open brackets and explicit line continuations
+    // also indent. Existing indentation is preserved on ordinary lines.
+    if (event.key === 'Enter' && modeOfPath(activePath) === 'python' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      event.preventDefault();
+      const value = editor.value;
+      const start = editor.selectionStart;
+      const end = editor.selectionEnd;
+      const lineStart = value.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
+      const lineEndFound = value.indexOf('\n', start);
+      const lineEnd = lineEndFound < 0 ? value.length : lineEndFound;
+      const lineBefore = value.slice(lineStart, start);
+      const lineWhole = value.slice(lineStart, lineEnd);
+      const indentMatch = lineWhole.match(/^[ \t]*/);
+      let indentation = indentMatch ? indentMatch[0] : '';
+      const sourceBefore = value.slice(0, start);
+      const codeBeforeCaret = lineBefore.trimEnd();
+      const hasCodeBeforeCaret = codeBeforeCaret.trim().length > 0;
+      const insideTripleQuotedBlock = pythonIsInsideTripleQuotedString(sourceBefore);
+      const shouldIndent = !insideTripleQuotedBlock && hasCodeBeforeCaret && (
+        pythonLineEndsWithBlockColon(codeBeforeCaret) ||
+        /\\\s*$/.test(codeBeforeCaret) ||
+        pythonHasUnclosedBracket(sourceBefore)
+      );
+      if (shouldIndent) indentation += '    ';
+      // Replace any selected text and insert the new line plus indentation.
+      editor.setRangeText('\n' + indentation, start, end, 'end');
+      editor.dispatchEvent(new Event('input', { bubbles: true }));
+      renderCompletions();
+      return;
+    }
+
+    // Typing > completes an opening tag and inserts its closing tag.
+    if (event.key === '>' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      const start = editor.selectionStart;
+      const end = editor.selectionEnd;
+      if (isInsideHtmlComment(editor.value, start)) return;
+      const before = editor.value.slice(0, start);
+      if (cssContext(before) || inJavaScriptBlock(before, start)) return;
+      const opening = before.match(/<([A-Za-z][\w:-]*)(?:\s[^<>]*)?$/);
+      const isSelfClosing = /\/\s*$/.test(before);
+
+      if (opening && !isSelfClosing) {
+        event.preventDefault();
+        const tag = opening[1];
+        const closing = voidTags.has(tag.toLowerCase()) ? '' : `</${tag}>`;
+        insertTextAtCursor('>' + closing, 1);
+        return;
+      }
+    }
+
+    if (event.key === 'Tab') {
+      event.preventDefault();
+      const start = editor.selectionStart;
+      const end = editor.selectionEnd;
+      const before = editor.value.slice(0, start);
+
+      // Tab can finish a partial tag, e.g. <h1 -> <h1></h1>.
+      if (start === end) {
+        const partial = before.match(/<([A-Za-z][\w:-]*)$/);
+        if (partial) {
+          const tag = partial[1];
+          const ending = '>' + (voidTags.has(tag.toLowerCase()) ? '' : `</${tag}>`);
+          insertTextAtCursor(ending, 1);
+          return;
+        }
+
+        // If a complete opening tag was pasted or already existed, Tab can
+        // add its missing closing tag, unless one is already next in the code.
+        const complete = before.match(/<([A-Za-z][\w:-]*)\b[^<>]*>$/);
+        if (complete && !/\/\s*>$/.test(complete[0])) {
+          const tag = complete[1];
+          const after = editor.value.slice(end);
+          const hasClosingAhead = new RegExp('^\\s*</' + tag + '\\s*>', 'i').test(after);
+          if (!voidTags.has(tag.toLowerCase()) && !hasClosingAhead) {
+            insertTextAtCursor(`</${tag}>`, 0);
+            return;
+          }
+        }
+      }
+
+      // Python convention: Tab inserts four spaces; other languages keep two.
+      const tabText = modeOfPath(activePath) === 'python' ? '    ' : '  ';
+      insertTextAtCursor(tabText, tabText.length);
+    }
+  });
+  const topStdinInput = document.getElementById('stdinInput');
+  if (topStdinInput) topStdinInput.addEventListener('input', event => {
+    if (modeOfPath(activePath) === 'python') nativePythonInputBuffer = event.target.value;
+    if (modeOfPath(activePath) === 'typescript') nativeTypeScriptInputBuffer = event.target.value;
+  });
+  document.getElementById('run').addEventListener('click', () => isNativeLanguageMode(modeOfPath(activePath)) ? executeNativeCode() : run());
+  window.addEventListener('message', event => {
+    if (event.source !== preview.contentWindow || !event.data) return;
+    // Keep the entire Python input draft synced while typing, so output-page
+    // refreshes cannot lose lines and no input limit is reintroduced implicitly.
+    if (event.data.__nativeInputDraft === true && modeOfPath(activePath) === 'python') {
+      nativePythonInputBuffer = String(event.data.input ?? '');
+      const topInput = document.getElementById('stdinInput');
+      if (topInput) topInput.value = nativePythonInputBuffer;
+      return;
+    }
+    if (event.data.__nativeInputDraft === true) {
+      const activeMode = modeOfPath(activePath);
+      if (isNativeLanguageMode(activeMode) && activeMode !== 'python' && activeMode !== 'sql' &&
+          (!event.data.languageKey || event.data.languageKey === activeMode)) {
+        const draft = String(event.data.input ?? '');
+        nativeProgramInputBuffers[activeMode] = draft;
+        if (activeMode === 'typescript') nativeTypeScriptInputBuffer = draft;
+      }
+      return;
+    }
+    if (event.data.__nativeRunWithInput !== true) return;
+    if (isNativeLanguageMode(modeOfPath(activePath))) {
+      const suppliedInput = String(event.data.input ?? '');
+      if (modeOfPath(activePath) === 'python') nativePythonInputBuffer = suppliedInput;
+      if (modeOfPath(activePath) === 'typescript') nativeTypeScriptInputBuffer = suppliedInput;
+      executeNativeCode(suppliedInput);
+    }
+  });
+  document.getElementById('clear').addEventListener('click', () => {
+    if (!editorFid) return;
+    if (editor.value.trim() && !confirm('Clear all code in ' + activePath + '? Everyone in the room will see it. You can undo with Ctrl+Z.')) return;
+    editor.value = '';
+    saveActiveEditorToProject();
+    collabAfterLocalEdit();
+    scheduleSave();
+    status.textContent = 'Active file cleared. Ctrl+Z brings it back.';
+    nativeExpectedInputCount = null;
+    nativePythonUsesDynamicInput = false;
+    nativePythonInputBuffer = '';
+    const topStdinInput = document.getElementById('stdinInput');
+    if (topStdinInput) topStdinInput.value = '';
+    updateEditor();
+    run();
+    if (modeOfPath(activePath) === 'python') refreshPythonInputRequirement();
+    editor.focus();
+  });
+  document.getElementById('boiler').addEventListener('click', () => {
+    const mode = modeOfPath(activePath);
+    const isHtml = mode === 'html';
+    const starter = isHtml ? BOILERPLATE : suggestStarter(activePath);
+    if (!starter) { status.textContent = 'No starter template is available for this file type.'; return; }
+    const label = isHtml ? 'HTML boilerplate' : languageNameForMode(mode) + ' starter';
+    if (editor.value.trim() && !confirm('Replace all current code with the ' + label + '?')) return;
+    editor.value = '';
+    editor.focus();
+    insertTextAtCursor(starter, isHtml ? BOILERPLATE_CURSOR : Math.min(starter.length, starter.indexOf('\n') + 1));
+    status.textContent = label + ' inserted.';
+  });
+  document.getElementById('print').addEventListener('click', () => {
+    try { preview.contentWindow.postMessage('__print_preview__', '*'); }
+    catch (e) { status.textContent = 'Printing was blocked by the browser. Use Print this page inside the preview.'; }
+  });
+  document.getElementById('download').addEventListener('click', () => {
+    saveActiveEditorToProject();
+    const activeRecord = projectFiles.get(activePath);
+    const downloadText = activeRecord && isTextProjectPath(activePath) ? (activeRecord.content || editor.value) : editor.value;
+    const mime = extensionOf(activePath) === 'css' ? 'text/css;charset=utf-8' : ['js','mjs','cjs','ts','jsx','tsx'].includes(extensionOf(activePath)) ? 'text/javascript;charset=utf-8' : isHtmlPath(activePath) ? 'text/html;charset=utf-8' : 'text/plain;charset=utf-8';
+    const blob = new Blob([downloadText], {type:mime});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = baseName(activePath || 'index.html');
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    status.textContent = 'Download started for ' + (activePath || 'current file') + '.';
+  });
+
+  // ---------- Save to a real file on your computer (like VS Code) ----------
+  // Uses the File System Access API (Chrome / Edge / Opera). You pick a file once,
+  // then everything you type is written to it automatically.
+  const fileNameEl = document.getElementById('fileName');
+  const saveStateEl = document.getElementById('saveState');
+  const supportsFS = 'showSaveFilePicker' in window;
+  let fileHandle = null;
+  let handlePath = '';
+  let saveTimer = null;
+  let saving = false;
+  let dirty = false;
+  let autoSavePaused = false;   // set after a reload until the user confirms with Ctrl+S
+  const FILE_TYPES = [{ description: 'HTML file', accept: { 'text/html': ['.html', '.htm'] } }];
+
+  function setSaveState(text, cls) {
+    saveStateEl.textContent = text;
+    saveStateEl.className = 'live ' + (cls || '');
+  }
+
+  // Remember the chosen file between visits (handles can be stored in IndexedDB).
+  function idb() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open('live-html-editor', 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('kv');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async function idbSet(key, value) {
+    try {
+      const db = await idb();
+      await new Promise((res, rej) => {
+        const tx = db.transaction('kv', 'readwrite');
+        tx.objectStore('kv').put(value, key);
+        tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+      });
+    } catch (e) {}
+  }
+  async function idbGet(key) {
+    try {
+      const db = await idb();
+      return await new Promise((res, rej) => {
+        const r = db.transaction('kv').objectStore('kv').get(key);
+        r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+      });
+    } catch (e) { return null; }
+  }
+
+  async function ensurePermission(handle, ask) {
+    const opts = { mode: 'readwrite' };
+    if ((await handle.queryPermission(opts)) === 'granted') return true;
+    if (ask && (await handle.requestPermission(opts)) === 'granted') return true;
+    return false;
+  }
+
+  function attachHandle(handle) {
+    autoSavePaused = false;
+    fileHandle = handle;
+    handlePath = activePath;
+    const rec = projectFiles.get(activePath); if (rec) rec.handle = handle;
+    fileNameEl.textContent = activePath || handle.name;
+    idbSet('handle', handle);
+    document.getElementById('chooseFile').textContent = '💾 Change Save File';
+  }
+
+  async function writeNow() {
+    if (autoSavePaused) return;
+    if (!fileHandle || activePath !== handlePath || saving) { if (saving) dirty = true; return; }
+    const targetHandle = fileHandle;
+    const targetPath = activePath;
+    const contentSnapshot = editor.value;
+    saving = true; dirty = false;
+    setSaveState('● Saving…', 'saving');
+    try {
+      if (!(await ensurePermission(targetHandle, false))) {
+        setSaveState('⚠ Click "Choose Save File" to reconnect', 'err');
+        return;
+      }
+      const writable = await targetHandle.createWritable();
+      await writable.write(contentSnapshot);
+      await writable.close();
+      setSaveState('✔ Saved to ' + targetHandle.name, 'saved');
+    } catch (e) {
+      setSaveState('⚠ Save failed: ' + (e && e.message ? e.message : e), 'err');
+    } finally {
+      saving = false;
+      if (dirty && activePath === targetPath) scheduleSave();
+    }
+  }
+
+  function scheduleSave() {
+    if (autoSavePaused || !fileHandle || activePath !== handlePath) return;
+    setSaveState('● Unsaved changes…', 'saving');
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(writeNow, 400);
+  }
+
+  function noFSMessage() {
+    setSaveState('○ Browser cannot save to PC', 'err');
+    status.textContent = 'Saving to a chosen file needs Chrome, Edge or Opera. In this browser use Download HTML instead.';
+  }
+
+  async function chooseSaveFile() {
+    if (!supportsFS) return noFSMessage();
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: fileHandle ? fileHandle.name : 'index.html',
+        startIn: 'desktop',
+        types: FILE_TYPES
+      });
+      attachHandle(handle);
+      await writeNow();
+    } catch (e) { /* user cancelled */ }
+  }
+
+  async function openFromDisk() {
+    if (!supportsFS) { document.getElementById('projectFilesInput').click(); return; }
+    try {
+      const [handle] = await window.showOpenFilePicker({ startIn: 'desktop', types: [{ description: 'Web / source file', accept: { 'text/html': ['.html','.htm'], 'text/css': ['.css'], 'text/javascript': ['.js'], 'text/plain': ['.txt','.json','.svg'] } }] });
+      const file = await handle.getFile();
+      const path = normalizeProjectPath(file.name);
+      const added = await readFileIntoProject(file, path, handle);
+      activePath = added; selectedTreePath = added;
+      if (!openTabs.includes(added)) openTabs.push(added);
+      loadFileIntoEditor(added); collabAfterFileSwitch(); updateEditor(); renderAllProjectUi();
+      attachHandle(handle); run();
+      setSaveState('✔ Opened ' + handle.name + ' (auto-save on)', 'saved');
+    } catch (e) { /* user cancelled */ }
+  }
+
+  document.getElementById('chooseFile').addEventListener('click', chooseSaveFile);
+  saveStateEl.addEventListener('click', () => { if (fileHandle) ensurePermission(fileHandle, true).then(writeNow); });
+  saveStateEl.style.cursor = 'pointer';
+  document.getElementById('openFile').addEventListener('click', openFromDisk);
+  document.getElementById('openFolder').addEventListener('click', async () => {
+    if ('showDirectoryPicker' in window) {
+      try { const dir = await window.showDirectoryPicker({ mode: 'readwrite' }); await importDirectoryHandle(dir); }
+      catch (e) { if (e && e.name !== 'AbortError') status.textContent = 'Could not open folder: ' + e.message; }
+    } else document.getElementById('projectFolderInput').click();
+  });
+  document.getElementById('addFiles').addEventListener('click', () => document.getElementById('projectFilesInput').click());
+  document.getElementById('projectFilesInput').addEventListener('change', async e => {
+    await importFileList(e.target.files, false); e.target.value = '';
+  });
+  document.getElementById('projectFolderInput').addEventListener('change', async e => {
+    await importFileList(e.target.files, true); e.target.value = '';
+  });
+  document.getElementById('newFile').addEventListener('click', createProjectFile);
+  document.getElementById('newFolder').addEventListener('click', createProjectFolder);
+  document.getElementById('renameFile').addEventListener('click', renameActiveProjectFile);
+  document.getElementById('deleteFile').addEventListener('click', deleteActiveProjectFile);
+  document.getElementById('saveProject').addEventListener('click', saveWholeProject);
+  editor.addEventListener('input', scheduleSave);
+
+  // Ctrl+S = save now (or pick a file the first time), Ctrl+O = open.
+  document.addEventListener('keydown', e => {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    const k = e.key.toLowerCase();
+    if (k === 's') { e.preventDefault(); fileHandle ? resumeOrSaveNow() : chooseSaveFile(); }
+    else if (k === 'o') { e.preventDefault(); openFromDisk(); }
+  });
+  window.addEventListener('beforeunload', e => {
+    if (fileHandle && (dirty || saving)) { e.preventDefault(); e.returnValue = ''; }
+  });
+
+  // After a reload the editor may not hold what is in the file on disk, so auto-save
+  // stays paused until Ctrl+S, and Ctrl+S asks before replacing different content.
+  async function resumeOrSaveNow() {
+    if (!(await ensurePermission(fileHandle, true))) return;
+    if (autoSavePaused) {
+      if (activePath !== handlePath) { status.textContent = 'Open ' + handlePath + ' to resume auto-saving it.'; return; }
+      try {
+        const onDisk = await (await fileHandle.getFile()).text();
+        if (onDisk !== editor.value && !confirm('The file ' + fileHandle.name + ' on your computer is different from the editor. Replace it with the editor version?')) {
+          status.textContent = 'Auto-save stays paused. Nothing was overwritten.';
+          return;
+        }
+      } catch (err) { /* file missing: safe to write */ }
+      autoSavePaused = false;
+    }
+    writeNow();
+  }
+
+  // Reconnect to the file used last time.
+  if (supportsFS) {
+    idbGet('handle').then(async handle => {
+      if (!handle) return;
+      fileHandle = handle;
+      handlePath = handle.name;
+      autoSavePaused = true;
+      document.getElementById('chooseFile').textContent = '💾 Change Save File';
+      setSaveState('○ Auto-save paused · Ctrl+S to resume ' + handle.name, 'err');
+    });
+  } else {
+    setSaveState('○ Use Chrome/Edge to save to PC', 'err');
+  }
+
+  // ---------- Drag & drop / pick images, videos and audio (hold Shift while dragging, like VS Code) ----------
+  const editorShell = document.querySelector('.editor-shell');
+  const MAX_PREVIEW_BYTES = 40 * 1024 * 1024;
+  const mediaInput = document.getElementById('mediaInput');
+
+  function mediaKind(file) {
+    const t = (file.type || '').toLowerCase();
+    const n = file.name.toLowerCase();
+    if (t.startsWith('image/') || /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/.test(n)) return 'img';
+    if (t.startsWith('video/') || /\.(mp4|webm|ogv|mov|m4v)$/.test(n)) return 'video';
+    if (t.startsWith('audio/') || /\.(mp3|wav|ogg|oga|m4a|aac|flac)$/.test(n)) return 'audio';
+    return null;
+  }
+  function mediaTag(file, kind) {
+    const src = file.name;
+    const alt = file.name.replace(/\.[^.]+$/, '').replace(/[<>"&]/g, '');
+    if (kind === 'img') return '<img src="' + src + '" alt="' + alt + '">';
+    if (kind === 'video') return '<video src="' + src + '" controls></video>';
+    return '<audio src="' + src + '" controls></audio>';
+  }
+  function readAsDataURL(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+      r.readAsDataURL(file);
+    });
+  }
+
+  // ----- Drop caret: a blinking bar that shows exactly where the file will be inserted -----
+  const dropCaret = document.createElement('div');
+  dropCaret.id = 'dropCaret';
+  editor.parentElement.appendChild(dropCaret);
+  const measureCtx = document.createElement('canvas').getContext('2d');
+  let dropIndex = null;
+
+  function editorMetrics() {
+    const cs = getComputedStyle(editor);
+    measureCtx.font = cs.fontStyle + ' ' + cs.fontWeight + ' ' + cs.fontSize + ' ' + cs.fontFamily;
+    return {
+      lineHeight: parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.65,
+      padL: parseFloat(cs.paddingLeft) || 15,
+      padT: parseFloat(cs.paddingTop) || 15
+    };
+  }
+  function textWidth(str) { return measureCtx.measureText(str.replace(/\t/g, '  ')).width; }
+
+  // Convert a mouse position over the textarea into a character index.
+  function indexFromPoint(clientX, clientY) {
+    const m = editorMetrics();
+    const rect = editor.getBoundingClientRect();
+    const y = clientY - rect.top - m.padT + editor.scrollTop;
+    const x = clientX - rect.left - m.padL + editor.scrollLeft;
+    const rows = editor.value.split('\n');
+    const row = Math.max(0, Math.min(rows.length - 1, Math.floor(y / m.lineHeight)));
+    const line = rows[row];
+    let col = 0;
+    while (col < line.length && (textWidth(line.slice(0, col)) + textWidth(line.slice(0, col + 1))) / 2 < x) col++;
+    let index = 0;
+    for (let i = 0; i < row; i++) index += rows[i].length + 1;
+    return index + col;
+  }
+
+  function showDropCaret(index) {
+    const m = editorMetrics();
+    const before = editor.value.slice(0, index);
+    const rows = before.split('\n');
+    const row = rows.length - 1;
+    dropCaret.style.left = (m.padL + textWidth(rows[row]) - editor.scrollLeft - 1) + 'px';
+    dropCaret.style.top = (m.padT + row * m.lineHeight - editor.scrollTop + 1) + 'px';
+    dropCaret.style.height = (m.lineHeight - 2) + 'px';
+    dropCaret.style.display = 'block';
+  }
+  function hideDropCaret() { dropCaret.style.display = 'none'; dropIndex = null; }
+
+  async function insertMediaFiles(fileList, position) {
+    const files = Array.from(fileList);
+    const tags = [];
+    let skipped = 0, big = 0;
+    for (const file of files) {
+      const kind = mediaKind(file);
+      if (!kind) { skipped++; continue; }
+      if (file.size <= MAX_PREVIEW_BYTES) {
+        try { const dataUrl = await readAsDataURL(file); mediaMap.set(file.name, dataUrl); putProjectFile(file.name, { dataUrl, blob: file, type: file.type || '' }); } catch (e) { /* ignore */ }
+      } else { big++; putProjectFile(file.name, { blob: file, type: file.type || '' }); }
+      tags.push(mediaTag(file, kind));
+    }
+    if (!tags.length) {
+      status.textContent = 'Only image, video and audio files can be added.';
+      return;
+    }
+    const pos = position == null ? editor.selectionStart : position;
+    const lineStart = editor.value.lastIndexOf('\n', pos - 1) + 1;
+    const indent = (editor.value.slice(lineStart, pos).match(/^\s*/) || [''])[0];
+    const text = tags.join('\n' + indent);
+    editor.focus();
+    editor.setSelectionRange(pos, pos);
+    insertTextAtCursor(text, text.length);
+    let msg = 'Added ' + tags.length + ' media file' + (tags.length === 1 ? '' : 's') + ' to your code.';
+    if (big) msg += ' ' + big + ' file(s) are over 40 MB, so the preview cannot show them.';
+    if (skipped) msg += ' ' + skipped + ' unsupported file(s) skipped.';
+    msg += ' Keep the file in the same folder as your HTML.';
+    renderProjectTree();
+    status.textContent = msg;
+  }
+
+  function hasFiles(e) {
+    return e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+  }
+  editor.addEventListener('dragover', e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    editorShell.classList.add('dragging');
+    // Scroll the editor when the file is held near its top/bottom/left/right edge.
+    const rect = editor.getBoundingClientRect();
+    if (e.clientY < rect.top + 30) editor.scrollTop -= 12;
+    else if (e.clientY > rect.bottom - 30) editor.scrollTop += 12;
+    if (e.clientX < rect.left + 30) editor.scrollLeft -= 12;
+    else if (e.clientX > rect.right - 30) editor.scrollLeft += 12;
+    dropIndex = indexFromPoint(e.clientX, e.clientY);
+    showDropCaret(dropIndex);
+  });
+  const endDrag = () => { editorShell.classList.remove('dragging'); hideDropCaret(); };
+  editor.addEventListener('dragleave', endDrag);
+  window.addEventListener('dragend', endDrag);
+  editor.addEventListener('drop', e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    const where = indexFromPoint(e.clientX, e.clientY);
+    endDrag();
+    insertMediaFiles(e.dataTransfer.files, where);
+  });
+  // Stop the browser from opening a file that is dropped outside the editor.
+  window.addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });
+  window.addEventListener('drop', e => { if (hasFiles(e)) e.preventDefault(); });
+
+  // Pasting an image from the clipboard works too.
+  editor.addEventListener('paste', e => {
+    const files = Array.from((e.clipboardData && e.clipboardData.files) || []).filter(f => mediaKind(f));
+    if (!files.length) return;
+    e.preventDefault();
+    insertMediaFiles(files);
+  });
+
+  document.getElementById('addMedia').addEventListener('click', () => mediaInput.click());
+  mediaInput.addEventListener('change', () => {
+    if (mediaInput.files.length) insertMediaFiles(mediaInput.files);
+    mediaInput.value = '';
+  });
+
+  // Resizable code-editor / live-preview divider. This add-on is isolated from
+  // every language runner and preserves the existing responsive layout.
+  const splitWorkspace = document.querySelector('.workspace');
+  const splitHandle = document.getElementById('editorPreviewResizer');
+  const splitEditorPanel = document.querySelector('.editor-panel');
+  const splitPreviewPanel = document.querySelector('.preview-panel');
+  const explorerPanel = document.getElementById('explorerPanel');
+  const explorerToggle = document.getElementById('toggleExplorer');
+  const explorerToggleIcon = document.getElementById('explorerToggleIcon');
+  const explorerStorageKey = 'multilanguageEditorExplorerCollapsedV1';
+  const splitStorageKey = 'multilanguageEditorPreviewSplitV1';
+  let explorerCollapsed = false;
+  try { explorerCollapsed = localStorage.getItem(explorerStorageKey) === 'true'; } catch (_) { /* Optional preference only. */ }
+  let editorShare = 0.5;
+  let splitDrag = null;
+  try {
+    const savedSplit = Number(localStorage.getItem(splitStorageKey));
+    if (Number.isFinite(savedSplit) && savedSplit >= 0.25 && savedSplit <= 0.75) editorShare = savedSplit;
+  } catch (_) { /* Storage may be disabled; resizing still works for this session. */ }
+
+  function splitIsDesktop() { return window.matchMedia('(min-width: 1101px)').matches; }
+  function clampEditorShare(value) {
+    const editorWidth = splitEditorPanel ? splitEditorPanel.getBoundingClientRect().width : 0;
+    const previewWidth = splitPreviewPanel ? splitPreviewPanel.getBoundingClientRect().width : 0;
+    const flexibleWidth = editorWidth + previewWidth;
+    const minShare = Math.min(0.45, Math.max(0.25, flexibleWidth ? 220 / flexibleWidth : 0.25));
+    return Math.min(1 - minShare, Math.max(minShare, value));
+  }
+  function updateSplitAccessibleValue() {
+    if (!splitHandle) return;
+    const pct = Math.round(editorShare * 100);
+    splitHandle.setAttribute('aria-valuenow', String(pct));
+    splitHandle.setAttribute('aria-valuetext', 'Code editor ' + pct + '%; Live preview ' + (100 - pct) + '%');
+  }
+  function applyEditorPreviewSplit(value, persist) {
+    if (!splitWorkspace || !splitHandle) return;
+    editorShare = clampEditorShare(value);
+    if (splitIsDesktop()) {
+      const explorerWidth = explorerCollapsed ? 48 : 230;
+      splitWorkspace.style.gridTemplateColumns = explorerWidth + 'px minmax(220px, ' + editorShare + 'fr) 12px minmax(220px, ' + (1 - editorShare) + 'fr)';
+    } else {
+      // Remove inline grid columns so the existing tablet/mobile CSS is in charge.
+      splitWorkspace.style.gridTemplateColumns = '';
+    }
+    updateSplitAccessibleValue();
+    if (persist) {
+      try { localStorage.setItem(splitStorageKey, String(editorShare)); } catch (_) { /* Optional preference only. */ }
+    }
+  }
+  function stopSplitDrag() {
+    if (!splitDrag) return;
+    splitDrag = null;
+    splitWorkspace.classList.remove('is-resizing');
+    applyEditorPreviewSplit(editorShare, true);
+  }
+  function syncExplorerCollapsedUi() {
+    if (explorerPanel) explorerPanel.classList.toggle('is-collapsed', explorerCollapsed);
+    if (splitWorkspace) splitWorkspace.classList.toggle('explorer-collapsed', explorerCollapsed);
+    if (explorerToggle) {
+      explorerToggle.setAttribute('aria-expanded', String(!explorerCollapsed));
+      explorerToggle.setAttribute('aria-label', explorerCollapsed ? 'Expand Explorer' : 'Collapse Explorer');
+      explorerToggle.title = explorerCollapsed ? 'Expand Explorer' : 'Collapse Explorer';
+    }
+    if (explorerToggleIcon) explorerToggleIcon.textContent = explorerCollapsed ? '›' : '‹';
+  }
+  syncExplorerCollapsedUi();
+  if (explorerToggle) {
+    explorerToggle.addEventListener('click', function(event) {
+      event.preventDefault();
+      explorerCollapsed = !explorerCollapsed;
+      syncExplorerCollapsedUi();
+      applyEditorPreviewSplit(editorShare, false);
+      try { localStorage.setItem(explorerStorageKey, String(explorerCollapsed)); } catch (_) { /* Optional preference only. */ }
+    });
+  }
+
+  if (splitWorkspace && splitHandle && splitEditorPanel && splitPreviewPanel) {
+    splitHandle.addEventListener('pointerdown', function(event) {
+      if (!splitIsDesktop() || event.button !== 0) return;
+      event.preventDefault();
+      const flexibleWidth = splitEditorPanel.getBoundingClientRect().width + splitPreviewPanel.getBoundingClientRect().width;
+      splitDrag = { pointerId: event.pointerId, startX: event.clientX, startShare: editorShare, flexibleWidth: Math.max(1, flexibleWidth) };
+      splitWorkspace.classList.add('is-resizing');
+      try { splitHandle.setPointerCapture(event.pointerId); } catch (_) { /* Pointer capture is optional. */ }
+    });
+    splitHandle.addEventListener('pointermove', function(event) {
+      if (!splitDrag || event.pointerId !== splitDrag.pointerId) return;
+      const delta = (event.clientX - splitDrag.startX) / splitDrag.flexibleWidth;
+      applyEditorPreviewSplit(splitDrag.startShare + delta, false);
+    });
+    splitHandle.addEventListener('pointerup', stopSplitDrag);
+    splitHandle.addEventListener('pointercancel', stopSplitDrag);
+    splitHandle.addEventListener('lostpointercapture', stopSplitDrag);
+    splitHandle.addEventListener('dblclick', function(event) {
+      event.preventDefault();
+      applyEditorPreviewSplit(0.5, true);
+    });
+    splitHandle.addEventListener('keydown', function(event) {
+      if (!splitIsDesktop()) return;
+      const step = event.shiftKey ? 0.05 : 0.02;
+      if (event.key === 'ArrowLeft') { event.preventDefault(); applyEditorPreviewSplit(editorShare - step, true); }
+      else if (event.key === 'ArrowRight') { event.preventDefault(); applyEditorPreviewSplit(editorShare + step, true); }
+      else if (event.key === 'Home') { event.preventDefault(); applyEditorPreviewSplit(0.5, true); }
+    });
+    window.addEventListener('resize', function() {
+      if (!splitIsDesktop()) {
+        splitWorkspace.classList.remove('is-resizing');
+        splitDrag = null;
+        splitWorkspace.style.gridTemplateColumns = '';
+      } else {
+        applyEditorPreviewSplit(editorShare, false);
+      }
+    });
+    applyEditorPreviewSplit(editorShare, false);
+  }
+
+  // =====================================================================
+  // H9: real-time collaboration
+  //   transport  : WebSocket to the sync server + BroadcastChannel between tabs
+  //   offline    : every operation is saved in IndexedDB first; on reconnect the two
+  //                sides swap state vectors and send each other only what is missing
+  //   presence   : names, colours, live cursors and selections, who is in which file
+  //   undo       : Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y only revert your own changes
+  // =====================================================================
+  const SEED = '~seed';
+  const COLLAB_COLORS = ['#f97316', '#22c55e', '#38bdf8', '#f43f5e', '#a78bfa', '#2dd4bf', '#facc15', '#f472b6'];
+  const COLLAB_ANIMALS = ['Tiger', 'Falcon', 'Panda', 'Otter', 'Lynx', 'Koala', 'Cobra', 'Yak', 'Heron', 'Bison'];
+  const opSpan = DragonCRDT.opSpan;
+
+  // The signed-in profile (name + cursor colour), saved in this browser by the sign-in page
+  // or Settings. People who set a name before profiles existed count as signed in.
+  function loadProfile() {
+    let p = null;
+    try { p = JSON.parse(localStorage.getItem('dragonProfile') || 'null'); } catch (e) {}
+    if (p && typeof p.name === 'string' && p.name.trim()) return { name: p.name.trim().slice(0, 24), color: COLLAB_COLORS.includes(p.color) ? p.color : null };
+    try { const old = JSON.parse(localStorage.getItem('dragonUser') || 'null'); if (old && old.name) return { name: String(old.name).slice(0, 24), color: null }; } catch (e) {}
+    return null;
+  }
+  let collabProfile = loadProfile();     // only used when there is no sync server (opened as a file)
+  // The logged-in account: { token, user: { id, name, email, color, theme }, remember }.
+  // "Keep me logged in" keeps it in localStorage; otherwise only for this browser session.
+  const AUTH_KEY = 'dragonAuth';
+  function loadAuth() {
+    for (const store of [localStorage, sessionStorage]) {
+      try {
+        const a = JSON.parse(store.getItem(AUTH_KEY) || 'null');
+        if (a && typeof a.token === 'string' && a.user && typeof a.user.name === 'string') return a;
+      } catch (e) {}
+    }
+    return null;
+  }
+  function saveAuth(auth) {
+    try {
+      (auth.remember ? localStorage : sessionStorage).setItem(AUTH_KEY, JSON.stringify(auth));
+      (auth.remember ? sessionStorage : localStorage).removeItem(AUTH_KEY);
+    } catch (e) {}
+  }
+  function clearAuth() {
+    try { localStorage.removeItem(AUTH_KEY); sessionStorage.removeItem(AUTH_KEY); } catch (e) {}
+    collabAuth = null;
+  }
+  let collabAuth = loadAuth();
+  const collabUser = (() => {
+    let tab = null;
+    try { tab = JSON.parse(sessionStorage.getItem('dragonUser') || 'null'); } catch (e) {}
+    const pick = list => list[Math.floor(Math.random() * list.length)];
+    const account = collabAuth && collabAuth.user;
+    const name = ((account && account.name) || COLLAB_PARAMS.get('name') || (collabProfile && collabProfile.name) || (tab && tab.name) || (pick(COLLAB_ANIMALS) + ' ' + (10 + Math.floor(Math.random() * 90)))).slice(0, 24);
+    const color = (account && COLLAB_COLORS.includes(account.color) && account.color) || (collabProfile && collabProfile.color) || (tab && tab.color) || pick(COLLAB_COLORS);
+    return { name, color };
+  })();
+  function saveCollabUser(asDefault) {
+    try { sessionStorage.setItem('dragonUser', JSON.stringify(collabUser)); } catch (e) {}
+    if (asDefault) { try { localStorage.setItem('dragonUser', JSON.stringify({ name: collabUser.name })); } catch (e) {} }
+  }
+  saveCollabUser(false);
+  // A stable identity for this browser: it survives reloads and reconnects (a fresh client
+  // ID is still used for every page load). The server uses it for terminal permissions;
+  // the secret key proves a reconnecting browser is the same one.
+  const collabIdentity = (() => {
+    const rand = n => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => (b % 36).toString(36)).join('');
+    let v = null;
+    try { v = JSON.parse(localStorage.getItem('dragonIdentity') || 'null'); } catch (e) {}
+    if (!v || typeof v.id !== 'string' || typeof v.key !== 'string' || v.key.length < 16) {
+      v = { id: 'u-' + rand(14), key: rand(40) };
+      try { localStorage.setItem('dragonIdentity', JSON.stringify(v)); } catch (e) {}
+    }
+    return v;
+  })();
+
+  function collabToast(text, kind) {
+    const host = document.getElementById('toastHost');
+    if (!host) return;
+    const el = document.createElement('div');
+    el.className = 'toast' + (kind ? ' ' + kind : '');
+    el.textContent = text;
+    host.appendChild(el);
+    setTimeout(() => el.remove(), kind === 'warn' ? 7000 : 4500);
+    while (host.children.length > 4) host.firstChild.remove();
+  }
+
+  // ---------- saving operations in this browser (IndexedDB) ----------
+  // Your own edits are written at once (one transaction per burst of typing), so a refresh
+  // straight after typing keeps them. Teammates' edits are batched every 100 ms.
+  // "Saving on this device" shows until the transaction holding your edits has committed.
+  const collabStore = (() => {
+    let dbPromise = null, queue = [], timer = null, retryTimer = null, warned = false;
+    let running = false, unsavedMine = 0, microtaskQueued = false;
+    let counter = Date.now() * 1000;
+    function open() {
+      if (!dbPromise) dbPromise = new Promise((resolve, reject) => {
+        const req = indexedDB.open('dragon-collab', 1);
+        req.onupgradeneeded = () => req.result.createObjectStore('ops', { keyPath: 'key' }).createIndex('room', 'room');
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+      dbPromise.catch(() => { dbPromise = null; });
+      return dbPromise;
+    }
+    function save(ops, mine) {
+      for (const op of ops) {
+        if (op.c === SEED) continue;
+        queue.push({ key: collabRoom + '|' + op.c + '|' + op.s, room: collabRoom, n: ++counter, mine: !!mine, op });
+        if (mine) unsavedMine++;
+      }
+      if (mine) {
+        if (!microtaskQueued) { microtaskQueued = true; queueMicrotask(() => { microtaskQueued = false; flush(); }); }
+      } else if (!timer) timer = setTimeout(flush, 100);
+    }
+    function write(batch) {
+      return open().then(db => new Promise((resolve, reject) => {
+        const tx = db.transaction('ops', 'readwrite');
+        const store = tx.objectStore('ops');
+        for (const row of batch) store.put(row);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error('aborted'));
+      }));
+    }
+    async function flush() {
+      clearTimeout(timer); timer = null;
+      if (running) return;            // the running loop picks up anything queued meanwhile
+      running = true;
+      try {
+        while (queue.length) {
+          const batch = queue; queue = [];
+          try {
+            await write(batch);
+            unsavedMine -= batch.filter(row => row.mine).length;
+          } catch (e) {
+            queue = batch.concat(queue);
+            if (!warned) { warned = true; collabToast('This browser blocked local storage, so offline edits will not survive a reload. Live sync still works.', 'warn'); }
+            clearTimeout(retryTimer); retryTimer = setTimeout(flush, 2000);
+            break;
+          }
+        }
+      } finally {
+        running = false;
+        updateSyncBadge();
+      }
+    }
+    async function load() {
+      try {
+        const db = await open();
+        const rows = await new Promise((resolve, reject) => {
+          const r = db.transaction('ops').objectStore('ops').index('room').getAll(collabRoom);
+          r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error);
+        });
+        rows.sort((a, b) => a.n - b.n);
+        return rows;
+      } catch (e) { return []; }
+    }
+    return { save, flush, load, isSaving: () => unsavedMine > 0 };
+  })();
+
+  // ---------- connection state ----------
+  const myOps = [];                    // operations made in this browser (for the pending counter)
+  const myMax = {};                    // client ID -> last sequence number I made under it
+  function noteMine(ops) { for (const op of ops) myMax[op.c] = Math.max(myMax[op.c] || 0, op.s + opSpan(op) - 1); }
+  // True while the server has not yet acknowledged some of my operations.
+  function hasPending() { for (const c in myMax) if (myMax[c] > (serverSv[c] || 0)) return true; return false; }
+  let serverSv = {};                   // what the server is known to have
+  try { serverSv = JSON.parse(localStorage.getItem('dragonSv:' + collabRoom) || '{}') || {}; } catch (e) {}
+  let collabServerUrl = (() => {
+    const fromUrl = COLLAB_PARAMS.get('server');
+    if (fromUrl) return fromUrl;
+    try { const saved = localStorage.getItem('dragonServer'); if (saved) return saved; } catch (e) {}
+    if (location.protocol === 'http:' || location.protocol === 'https:') return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+    return ''; // opened from a file: tabs in this browser still sync with each other
+  })();
+  let ws = null, wsOpen = false, wsRetry = 0, wsTimer = null;
+  let welcomed = false;                // the server has answered our hello for this connection
+  let wsStartedAt = 0, lastHeard = 0, awaitingAckSince = 0;
+  // Shared terminals (see "Shared terminals, Run and Debug" below)
+  let termCaps = null;                 // what the sync server offers: terminals, debuggers
+  let termList = [], termMembers = [];
+  let termActive = '';
+  try { termActive = sessionStorage.getItem('dragonTerm:' + collabRoom) || ''; } catch (e) {}
+  let termAttachedOn = null;           // the socket our current attach request went out on
+  let collabOffline = false;           // the "Go offline" switch
+  let mergeWindowUntil = 0, mergeCount = 0, mergeTimer = null, everConnected = false;
+  const bc = ('BroadcastChannel' in window) ? new BroadcastChannel('dragon-room-' + collabRoom) : null;
+
+  function wsSend(msg) {
+    if (!ws || !wsOpen) return;
+    // Every message carries this tab's clock, so the server can tell when terminal input
+    // was held up in the network and refuse it instead of running it late.
+    try { ws.send(JSON.stringify(Object.assign({ ct: Math.round(performance.now()) }, msg))); } catch (e) { return; }
+    if (msg.t === 'ops' && !awaitingAckSince) awaitingAckSince = Date.now();
+  }
+  function bcSend(msg) { if (bc && !collabOffline) { msg.from = collabClient; try { bc.postMessage(msg); } catch (e) {} } }
+  function rememberServerSv() {
+    try { localStorage.setItem('dragonSv:' + collabRoom, JSON.stringify(serverSv)); } catch (e) {}
+  }
+
+  function connectServer() {
+    clearTimeout(wsTimer);
+    if (collabOffline || !collabServerUrl || ws || !collabAuth) { updateSyncBadge(); return; }   // log in first
+    let socket;
+    try { socket = new WebSocket(collabServerUrl); } catch (e) { scheduleReconnect(); return; }
+    ws = socket;
+    wsStartedAt = Date.now(); welcomed = false; awaitingAckSince = 0;
+    updateSyncBadge();
+    socket.onopen = () => {
+      if (ws !== socket) return;
+      wsOpen = true; lastHeard = Date.now();
+      wsSend({ t: 'hello', room: collabRoom, client: collabClient, sv: crdt.sv, state: awarenessState(), password: collabPassword || undefined, user: collabIdentity, auth: collabAuth && collabAuth.token });
+      updateSyncBadge();
+    };
+    socket.onmessage = e => {
+      if (ws !== socket) return;
+      lastHeard = Date.now();
+      let msg; try { msg = JSON.parse(e.data); } catch (err) { return; }
+      handleCollabMessage(msg, 'ws');
+    };
+    socket.onclose = () => {
+      if (ws !== socket) return;
+      ws = null; wsOpen = false; welcomed = false; awaitingAckSince = 0;
+      dropPeers('ws');
+      updateSyncBadge();
+      scheduleReconnect();
+    };
+    socket.onerror = () => {};
+  }
+  // Hostel Wi-Fi often dies without closing the connection, so the browser keeps a dead
+  // socket open for minutes. Give up on a socket that stops answering and dial again;
+  // anything it swallowed is re-sent after the next "welcome" (the server drops duplicates).
+  function abandonSocket() {
+    if (!ws) return;
+    const dead = ws;
+    ws = null; wsOpen = false; welcomed = false; awaitingAckSince = 0;
+    try { dead.close(); } catch (e) {}
+    dropPeers('ws');
+    updateSyncBadge();
+    scheduleReconnect();
+  }
+  setInterval(() => {
+    if (!ws || collabOffline) return;
+    const now = Date.now();
+    if (!wsOpen && now - wsStartedAt > 10000) abandonSocket();                        // handshake hangs
+    else if (wsOpen && !welcomed && now - lastHeard > 10000) abandonSocket();         // no welcome
+    else if (wsOpen && awaitingAckSince && now - awaitingAckSince > 10000) abandonSocket(); // edits never acknowledged
+    else if (wsOpen && now - lastHeard > 45000) abandonSocket();                      // silent for too long
+  }, 2000);
+  function scheduleReconnect() {
+    if (collabOffline || collabDenied || !collabServerUrl) return;
+    clearTimeout(wsTimer);
+    const delay = Math.min(8000, 400 * Math.pow(2, wsRetry++)) + Math.random() * 300;
+    wsTimer = setTimeout(connectServer, delay);
+  }
+  function disconnectServer() {
+    clearTimeout(wsTimer);
+    if (ws) { const s = ws; ws = null; wsOpen = false; try { s.close(); } catch (e) {} }
+    welcomed = false; awaitingAckSince = 0;
+    dropPeers('ws');
+  }
+  // What the server has. "welcome" and "resync" are full snapshots and replace our view
+  // (if the server lost its data, we notice and send everything again); an "ack" only
+  // ever moves a client's number forward.
+  function mergeServerSv(sv, snapshot) {
+    if (snapshot) serverSv = {};
+    for (const c in sv || {}) if (Number.isInteger(sv[c]) && sv[c] > (serverSv[c] || 0)) serverSv[c] = sv[c];
+    rememberServerSv();
+    awaitingAckSince = hasPending() && awaitingAckSince ? Date.now() : 0;   // progress resets the timer
+  }
+
+  function handleCollabMessage(msg, via) {
+    if (collabOffline || !msg) return;
+    if (msg.t === 'welcome' && via === 'ws') {
+      mergeServerSv(msg.sv, true);
+      welcomed = true; wsRetry = 0;
+      termCaps = msg.caps || null;
+      updateRuntimeUi();
+      accountFromServer(msg.account);
+      roomLocked = !!msg.locked;
+      updateLockButton();
+      // Coming back with offline edits: keep "my version before the merge" as a checkpoint.
+      const offlineEdits = myOps.some(op => op.k !== 'set' && op.s + opSpan(op) - 1 > (serverSv[op.c] || 0));
+      if (offlineEdits) createCheckpoint(collabUser.name + '’s version before merging', true);
+      if (everConnected || crdt.log.some(op => op.c !== SEED && op.k !== 'set')) { mergeWindowUntil = Date.now() + 5000; mergeCount = 0; }
+      everConnected = true;
+      const missing = crdt.opsMissing(serverSv);
+      for (let i = 0; i < missing.length; i += 1000) wsSend({ t: 'ops', ops: missing.slice(i, i + 1000) });
+      const real = missing.filter(op => op.c !== SEED && op.k !== 'set').length;   // text edits, not name/registry updates
+      if (real) collabToast('Sent ' + real + ' edit' + (real === 1 ? '' : 's') + ' made while offline. Merging with the room…');
+      updateSyncBadge();
+    } else if (msg.t === 'ops') {
+      receiveOps(msg.ops, via);
+    } else if (msg.t === 'resync' && via === 'ws') {
+      mergeServerSv(msg.sv, true);
+      const missing = crdt.opsMissing(serverSv);
+      for (let i = 0; i < missing.length; i += 1000) wsSend({ t: 'ops', ops: missing.slice(i, i + 1000) });
+      updateSyncBadge();
+    } else if (msg.t === 'denied' && via === 'ws' && msg.reason === 'login') {
+      sessionEnded('Your session has ended. Please log in again.');
+    } else if (msg.t === 'denied' && via === 'ws') {
+      collabDenied = true; deniedReason = msg.reason || 'locked';
+      updateLockButton();
+      updateSyncBadge();
+      setTimeout(askPassword, 50);
+    } else if (msg.t === 'locked' && via === 'ws') {
+      roomLocked = !!msg.locked;
+      updateLockButton();
+      collabToast(msg.locked ? (msg.by || 'Someone') + ' locked this room with a password. You stay connected.' : (msg.by || 'Someone') + ' removed the room password.');
+    } else if (msg.t === 'ack' && via === 'ws') {
+      mergeServerSv(msg.sv);   // the server only acks after writing the operations to disk
+      updateSyncBadge();
+    } else if (via === 'ws' && (msg.t === 'pong' || /^term-/.test(msg.t || ''))) {
+      handleTerminalMessage(msg);
+    } else if (msg.t === 'aw') {
+      setPeer(msg.client, msg.state, via);
+    } else if (msg.t === 'aw-leave') {
+      removePeer(msg.client);
+    } else if (msg.t === 'hello' && via === 'bc') {
+      const ops = crdt.opsMissing(msg.sv);
+      if (ops.length) bcSend({ t: 'ops', ops });
+      bcSend({ t: 'sv', sv: crdt.sv });
+      bcSend({ t: 'aw', client: collabClient, state: awarenessState() });
+      if (msg.state) setPeer(msg.client, msg.state, 'bc');
+    } else if (msg.t === 'sv' && via === 'bc') {
+      const ops = crdt.opsMissing(msg.sv);
+      if (ops.length) bcSend({ t: 'ops', ops });
+    }
+  }
+  if (bc) bc.onmessage = e => { const msg = e.data; if (msg && msg.from !== collabClient) handleCollabMessage(msg, 'bc'); };
+
+  // ---------- local changes: save, then send ----------
+  let outbox = [], flushQueued = false;
+  crdt.onChange((ops, origin) => {
+    if (origin !== 'local') return;
+    myOps.push(...ops);
+    noteMine(ops);
+    collabStore.save(ops, true);   // shows "Saving on this device" until IndexedDB commits
+    outbox.push(...ops);
+    updateSyncBadge();
+    if (flushQueued) return;
+    flushQueued = true;
+    Promise.resolve().then(() => {
+      flushQueued = false;
+      const batch = outbox; outbox = [];
+      if (!batch.length || collabOffline) { updateSyncBadge(); return; }
+      wsSend({ t: 'ops', ops: batch });  // if not connected, the next "welcome" sends them
+      bcSend({ t: 'ops', ops: batch });
+      updateSyncBadge();
+    });
+  });
+
+  // ---------- remote changes: merge into the document and the textarea ----------
+  let composing = false, deferredOps = [];
+  editor.addEventListener('compositionstart', () => { composing = true; });
+  editor.addEventListener('compositionend', () => {
+    composing = false;
+    setTimeout(() => { if (deferredOps.length) { const ops = deferredOps; deferredOps = []; receiveOps(ops, 'ws'); } }, 0);
+  });
+
+  function receiveOps(ops, via) {
+    if (!Array.isArray(ops) || !ops.length) return;
+    if (composing) { deferredOps.push(...ops); return; }   // never disturb IME typing
+    saveActiveEditorToProject();
+    const fid = editorFid;
+    const backward = editor.selectionDirection === 'backward';
+    const sel = fid ? { a: crdt.relAt(fid, editor.selectionStart), b: crdt.relAt(fid, editor.selectionEnd) } : null;
+    const visibleBefore = new Set(crdt.fileIds());
+    const done = crdt.apply(ops, 'remote');
+    if (!done.length) return;
+    if (via !== 'idb') collabStore.save(done, false);
+    if (via === 'bc') wsSend({ t: 'ops', ops: done });      // relay; the server drops duplicates
+    rebuildProjectView();
+    const visibleAfter = crdt.fileIds();
+    const structural = done.some(op => op.k === 'set') || visibleAfter.length !== visibleBefore.size || visibleAfter.some(f => !visibleBefore.has(f));
+
+    if (fid && !crdt.isVisible(fid)) {
+      const gone = baseName(crdt.get(fid, 'name') || 'file');
+      editorFid = null;
+      const next = openTabs[0] || projectFiles.keys().next().value;
+      activePath = '';
+      if (next) openProjectFile(next, true);
+      if (via !== 'idb') collabToast(gone + ' was deleted by a teammate. Ctrl+Z on their side, or any edit made offline, brings it back.', 'warn');
+    } else if (fid && done.some(op => op.f === fid && op.k !== 'set')) {
+      applyDocToEditor(sel, backward);
+    }
+    if (structural) {
+      if (activePath) fileNameEl.textContent = activePath + ' · ' + languageNameForMode(modeOfPath(activePath));
+      renderAllProjectUi();
+      for (const f of visibleAfter) {
+        if (!visibleBefore.has(f) && crdt.wasRestored(f) && via !== 'idb') collabToast(fidToPath.get(f) + ' came back: a teammate edited it at the same time it was deleted (or while offline), and edits win over deletes.');
+      }
+    }
+    if (Date.now() < mergeWindowUntil && via !== 'idb') {
+      mergeCount += done.filter(op => op.c !== SEED && op.k !== 'set').length;
+      markMerged(done);
+      clearTimeout(mergeTimer);
+      mergeTimer = setTimeout(() => { if (mergeCount) collabToast('Merged ' + mergeCount + ' change' + (mergeCount === 1 ? '' : 's') + ' from teammates. Nothing was overwritten. New text is highlighted in green.'); mergeCount = 0; }, 900);
+    }
+    if (!historyPanel.hidden) { clearTimeout(historyTimer); historyTimer = setTimeout(renderHistory, 300); }
+    schedulePreviewRefresh();
+    renderRemoteCursors();
+    updateSyncBadge();
+  }
+
+  function applyDocToEditor(sel, backward) {
+    const text = crdt.text(editorFid);
+    if (editor.value === text) return;
+    const top = editor.scrollTop, left = editor.scrollLeft;
+    editor.value = text;
+    if (sel) {
+      const a = crdt.indexAt(editorFid, sel.a) ?? 0;
+      const b = crdt.indexAt(editorFid, sel.b) ?? a;
+      editor.setSelectionRange(Math.min(a, b), Math.max(a, b), backward ? 'backward' : 'forward');
+    }
+    editor.scrollTop = top; editor.scrollLeft = left;
+    updateEditor();
+    if (popup.style.display === 'block') hideCompletions();
+  }
+
+  // Teammates' edits refresh the web preview after a short pause, not on every keystroke.
+  let previewTimer = null;
+  function schedulePreviewRefresh() {
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => { if (!isNativeLanguageMode(modeOfPath(activePath))) run(); }, 300);
+  }
+
+  // ---------- presence: who is here, where their cursor is ----------
+  function awarenessState() {
+    const fid = editorFid;
+    if (!fid) return { name: collabUser.name, color: collabUser.color, fid: null, path: '' };
+    const backward = editor.selectionDirection === 'backward';
+    const start = crdt.relAt(fid, editor.selectionStart), end = crdt.relAt(fid, editor.selectionEnd);
+    return { name: collabUser.name, color: collabUser.color, fid, path: fidToPath.get(fid) || '', a: backward ? end : start, h: backward ? start : end };
+  }
+  let awTimer = null, lastAwSent = 0;
+  function scheduleAwareness() {
+    if (awTimer) return;
+    awTimer = setTimeout(() => { awTimer = null; lastAwSent = Date.now(); sendAwareness(); }, Math.max(0, 60 - (Date.now() - lastAwSent)));
+  }
+  function sendAwareness() {
+    if (collabOffline) return;
+    const state = awarenessState();
+    wsSend({ t: 'aw', state });
+    bcSend({ t: 'aw', client: collabClient, state });
+  }
+  document.addEventListener('selectionchange', () => { if (document.activeElement === editor) scheduleAwareness(); });
+
+  function cleanState(state) {
+    if (!state || typeof state !== 'object') return null;
+    return {
+      name: String(state.name || 'Guest').slice(0, 24),
+      color: /^#[0-9a-f]{3,8}$/i.test(state.color || '') ? state.color : '#94a3b8',
+      fid: typeof state.fid === 'string' ? state.fid : null,
+      a: typeof state.a === 'string' ? state.a : null,
+      h: typeof state.h === 'string' ? state.h : null
+    };
+  }
+  function setPeer(client, rawState, via) {
+    if (!client || client === collabClient) return;
+    const state = cleanState(rawState);
+    const prev = collabPeers.get(client);
+    collabPeers.set(client, { state, via, t: Date.now() });
+    if (!prev || !prev.state || !state || prev.state.fid !== state.fid || prev.state.name !== state.name || prev.state.color !== state.color) {
+      renderProjectTree(); renderPeople();
+    }
+    renderRemoteCursors();
+  }
+  function removePeer(client) {
+    if (collabPeers.delete(client)) { renderProjectTree(); renderPeople(); renderRemoteCursors(); }
+  }
+  function dropPeers(via) {
+    let changed = false;
+    for (const [client, peer] of collabPeers) if (!via || peer.via === via) { collabPeers.delete(client); changed = true; }
+    if (changed) { renderProjectTree(); renderPeople(); renderRemoteCursors(); }
+  }
+  setInterval(() => {
+    sendAwareness();
+    const now = Date.now();
+    let changed = false;
+    for (const [client, peer] of collabPeers) if (now - peer.t > 30000) { collabPeers.delete(client); changed = true; }
+    if (changed) { renderProjectTree(); renderPeople(); renderRemoteCursors(); }
+  }, 10000);
+  window.addEventListener('pagehide', () => { bcSend({ t: 'aw-leave', client: collabClient }); collabStore.flush(); });
+
+  function renderPeople() {
+    const host = document.getElementById('collabPeople');
+    host.textContent = '';
+    for (const [client, peer] of collabPeers) {
+      if (!peer.state) continue;
+      const st = peer.state;
+      const path = st.fid ? fidToPath.get(st.fid) : '';
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'person-chip';
+      chip.title = st.name + (path ? ' is editing ' + path + ' (click to jump to their cursor)' : '');
+      const avatar = document.createElement('i');
+      avatar.style.background = st.color;
+      avatar.textContent = st.name.split(/\s+/).map(w => w[0] || '').join('').slice(0, 2).toUpperCase();
+      const name = document.createElement('span'); name.textContent = st.name;
+      const where = document.createElement('small'); where.textContent = path ? baseName(path) : '';
+      chip.append(avatar, name, where);
+      chip.addEventListener('click', () => jumpToPeer(client));
+      host.appendChild(chip);
+    }
+    const me = document.getElementById('renameMe');
+    me.textContent = 'You: ' + collabUser.name;
+    me.style.borderColor = collabUser.color;
+  }
+
+  // ---------- live cursors drawn over the textarea ----------
+  const cursorLayer = document.createElement('div');
+  cursorLayer.className = 'remote-cursor-layer';
+  editor.parentElement.appendChild(cursorLayer);
+  function caretXY(text, index) {
+    const before = text.slice(0, index);
+    let row = 0;
+    for (let i = before.indexOf('\n'); i !== -1; i = before.indexOf('\n', i + 1)) row++;
+    return { row, x: textWidth(before.slice(before.lastIndexOf('\n') + 1)) };
+  }
+  function renderRemoteCursors() {
+    cursorLayer.textContent = '';
+    if (!editorFid) return;
+    const m = editorMetrics();
+    const text = editor.value;
+    let lines = null;
+    for (const [from, to] of mergedRanges(editorFid)) {
+      lines = lines || text.split('\n');
+      const s = caretXY(text, from), e = caretXY(text, to);
+      for (let row = s.row; row <= e.row; row++) {
+        const x1 = row === s.row ? s.x : 0;
+        const x2 = row === e.row ? e.x : textWidth(lines[row] || '') + 6;
+        if (x2 <= x1) continue;
+        const r = document.createElement('div');
+        r.className = 'merge-mark';
+        r.style.cssText = 'left:' + (m.padL + x1 - editor.scrollLeft) + 'px;top:' + (m.padT + row * m.lineHeight - editor.scrollTop) + 'px;width:' + (x2 - x1) + 'px;height:' + m.lineHeight + 'px';
+        cursorLayer.appendChild(r);
+      }
+    }
+    for (const peer of collabPeers.values()) {
+      const st = peer.state;
+      if (!st || st.fid !== editorFid || !st.h) continue;
+      const h = crdt.indexAt(editorFid, st.h);
+      if (h == null) continue;
+      let a = st.a ? crdt.indexAt(editorFid, st.a) : h;
+      if (a == null) a = h;
+      if (a !== h) {
+        lines = lines || text.split('\n');
+        const s = caretXY(text, Math.min(a, h)), e = caretXY(text, Math.max(a, h));
+        for (let row = s.row; row <= e.row; row++) {
+          const x1 = row === s.row ? s.x : 0;
+          const x2 = row === e.row ? e.x : textWidth(lines[row] || '') + 6;
+          if (x2 <= x1) continue;
+          const r = document.createElement('div');
+          r.className = 'remote-sel';
+          r.style.cssText = 'left:' + (m.padL + x1 - editor.scrollLeft) + 'px;top:' + (m.padT + row * m.lineHeight - editor.scrollTop) + 'px;width:' + (x2 - x1) + 'px;height:' + m.lineHeight + 'px;background:' + st.color;
+          cursorLayer.appendChild(r);
+        }
+      }
+      const c = caretXY(text, h);
+      const caret = document.createElement('div');
+      caret.className = 'remote-caret';
+      caret.style.cssText = 'left:' + (m.padL + c.x - editor.scrollLeft - 1) + 'px;top:' + (m.padT + c.row * m.lineHeight - editor.scrollTop) + 'px;height:' + m.lineHeight + 'px;background:' + st.color;
+      const label = document.createElement('span');
+      label.textContent = st.name;
+      label.style.background = st.color;
+      if (c.row === 0) { label.style.bottom = 'auto'; label.style.top = '100%'; label.style.borderRadius = '0 4px 4px 4px'; }
+      caret.appendChild(label);
+      cursorLayer.appendChild(caret);
+    }
+  }
+  editor.addEventListener('scroll', renderRemoteCursors);
+  window.addEventListener('resize', renderRemoteCursors);
+
+  function collabAfterLocalEdit() { scheduleAwareness(); renderRemoteCursors(); }
+  function collabAfterFileSwitch() { scheduleAwareness(); renderRemoteCursors(); saveOpenTabs(); updateRuntimeUi(); }
+  // Remember which files were open, so a refresh (online or offline) reopens them.
+  const TABS_KEY = 'dragonTabs:' + collabRoom;
+  function saveOpenTabs() {
+    try {
+      sessionStorage.setItem(TABS_KEY, JSON.stringify({
+        tabs: openTabs.map(path => pathToFid.get(path)).filter(Boolean),
+        active: editorFid,
+        caret: editorFid ? crdt.relAt(editorFid, editor.selectionEnd) : null
+      }));
+    } catch (e) {}
+  }
+  function restoreOpenTabs() {
+    let saved = null;
+    try { saved = JSON.parse(sessionStorage.getItem(TABS_KEY) || 'null'); } catch (e) {}
+    if (!saved || !Array.isArray(saved.tabs)) return;
+    const paths = saved.tabs.map(fid => fidToPath.get(fid)).filter(Boolean);
+    if (!paths.length) return;
+    openTabs.length = 0;
+    openTabs.push(...paths);
+    const active = fidToPath.get(saved.active) || paths[0];
+    openProjectFile(active, true);
+    const caret = saved.caret ? crdt.indexAt(editorFid, saved.caret) : null;
+    if (caret != null) editor.setSelectionRange(caret, caret);
+  }
+  window.addEventListener('pagehide', saveOpenTabs);
+
+  // ---------- per-user undo / redo ----------
+  function collabUndo(redo) {
+    if (!editorFid) return;
+    saveActiveEditorToProject();
+    const caret = redo ? undoMgr.redo(editorFid) : undoMgr.undo(editorFid);
+    if (caret == null) {
+      status.textContent = redo ? 'Nothing to redo.' : 'Nothing of yours left to undo in this file. Teammates’ edits are never undone by you.';
+      return;
+    }
+    editor.value = crdt.text(editorFid);
+    editor.setSelectionRange(caret, caret);
+    updateEditor();
+    hideCompletions();
+    nativeRunSequence++;
+    if (modeOfPath(activePath) === 'python') refreshPythonInputRequirement(); else run();
+    collabAfterLocalEdit();
+    scheduleSave();
+    status.textContent = (redo ? 'Redo' : 'Undo') + ' · only your own changes are affected.';
+  }
+  editor.addEventListener('keydown', e => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+    const k = e.key.toLowerCase();
+    const isUndo = k === 'z' && !e.shiftKey;
+    const isRedo = (k === 'z' && e.shiftKey) || k === 'y';
+    if (!isUndo && !isRedo) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    collabUndo(isRedo);
+  }, true);
+  editor.addEventListener('beforeinput', e => {
+    if (e.inputType === 'historyUndo' || e.inputType === 'historyRedo') { e.preventDefault(); collabUndo(e.inputType === 'historyRedo'); }
+  });
+  editor.addEventListener('mousedown', () => undoMgr.stopCapturing());
+
+  // ---------- collaboration bar ----------
+  function pendingCount() {
+    let n = 0;
+    for (const op of myOps) if (op.s + opSpan(op) - 1 > (serverSv[op.c] || 0)) n++;
+    return n;
+  }
+  // Save/sync status, one of exactly four messages:
+  //   Saving on this device : some of my edits are not yet committed to IndexedDB
+  //   Saved on this device  : all my edits are in IndexedDB; not connected to the server
+  //   Syncing               : connected, but the server has not acknowledged all my edits
+  //   Synced                : the server acknowledged every edit I made (after writing it to disk)
+  // The connection itself is shown separately, next to it.
+  const SYNC_TEXT = { saving: 'Saving on this device', saved: 'Saved on this device', syncing: 'Syncing', synced: 'Synced' };
+  function syncState() {
+    if (collabStore.isSaving()) return 'saving';
+    if (!ws || !wsOpen || !welcomed || collabOffline || collabDenied) return 'saved';
+    return hasPending() ? 'syncing' : 'synced';
+  }
+  function connectionText() {
+    if (collabOffline) return ['offline', 'Offline (by you)'];
+    if (collabServerUrl && !collabAuth) return ['offline', 'Log in to sync'];
+    if (collabDenied) return ['offline', 'Room locked · enter the password'];
+    if (!collabServerUrl) return ['tabs', 'This browser only'];
+    if (ws && wsOpen && welcomed) return ['online', 'Online'];
+    if (ws) return ['connecting', 'Connecting…'];
+    return ['offline', navigator.onLine ? 'Offline · retrying' : 'Offline · no network'];
+  }
+  let badgeTimer = null, shownState = '';
+  function updateSyncBadge() {
+    const state = syncState();
+    if (state !== shownState) {             // the message itself changes at once
+      shownState = state;
+      const badge = document.getElementById('syncBadge');
+      badge.className = 'sync-badge ' + state;
+      badge.textContent = SYNC_TEXT[state];
+    }
+    if (badgeTimer) return;
+    badgeTimer = setTimeout(() => {
+      badgeTimer = null;
+      const pending = pendingCount();
+      document.getElementById('syncBadge').title = pending
+        ? pending + ' of your edit' + (pending === 1 ? ' is' : 's are') + ' saved on this device and not yet acknowledged by the server.'
+        : 'Every edit you made has been acknowledged by the server.';
+      const [cls, text] = connectionText();
+      const conn = document.getElementById('connBadge');
+      conn.className = 'conn-badge ' + cls;
+      conn.textContent = text;
+      const button = document.getElementById('toggleOffline');
+      button.textContent = collabOffline ? '📶 Go online' : '📴 Go offline';
+      button.classList.toggle('is-offline', collabOffline);
+      updateRuntimeUi();
+      renderTerminal();
+    }, 120);
+  }
+
+  document.getElementById('collabRoom').textContent = collabRoom;
+  document.getElementById('toggleOffline').addEventListener('click', () => {
+    if (!collabOffline) {
+      bcSend({ t: 'aw-leave', client: collabClient });
+      collabOffline = true;
+      disconnectServer();
+      dropPeers();
+      collabToast('You are offline. Keep editing: changes are saved in this browser and merge automatically when you go back online.');
+    } else {
+      collabOffline = false;
+      mergeWindowUntil = Date.now() + 5000; mergeCount = 0;
+      wsRetry = 0;
+      connectServer();
+      bcSend({ t: 'hello', client: collabClient, sv: crdt.sv, state: awarenessState() });
+    }
+    updateSyncBadge();
+  });
+  document.getElementById('shareRoom').addEventListener('click', async () => {
+    const url = location.origin + location.pathname + '?room=' + encodeURIComponent(collabRoom) + (COLLAB_PARAMS.get('server') ? '&server=' + encodeURIComponent(COLLAB_PARAMS.get('server')) : '');
+    if (location.protocol === 'file:') { collabToast('This page is open as a local file. Run the sync server (npm start) or deploy it, then share that link.', 'warn'); return; }
+    try { await navigator.clipboard.writeText(url); collabToast('Room link copied: ' + url); }
+    catch (e) { prompt('Copy this room link:', url); }
+  });
+  document.getElementById('setServer').addEventListener('click', () => {
+    const value = prompt('Sync server WebSocket address, e.g. wss://your-app.onrender.com/ws\n(leave empty to use the default)', collabServerUrl);
+    if (value === null) return;
+    try { if (value.trim()) localStorage.setItem('dragonServer', value.trim()); else localStorage.removeItem('dragonServer'); } catch (e) {}
+    disconnectServer();
+    collabServerUrl = value.trim() || ((location.protocol === 'http:' || location.protocol === 'https:') ? (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws' : '');
+    wsRetry = 0;
+    connectServer();
+    updateSyncBadge();
+    if (collabServerUrl && !collabAuth) showAuth(lastEmail() ? 'login' : 'signup');   // a server needs an account
+  });
+  document.getElementById('renameMe').addEventListener('click', () => openSettings());
+  window.addEventListener('online', () => { if (!collabOffline) { wsRetry = 0; mergeWindowUntil = Date.now() + 5000; clearTimeout(wsTimer); connectServer(); } });
+  // The network is gone: the socket is dead even if the browser has not noticed yet.
+  window.addEventListener('offline', () => { abandonSocket(); updateSyncBadge(); });
+
+  // =====================================================================
+  // Extras that make DRAGON stronger than the H9 minimum
+  //   version history · who wrote each line · merge highlights · room password
+  //   follow a teammate · undo that survives reload · self-healing resync
+  // =====================================================================
+
+  // ---------- who is who (names for authorship and history) ----------
+  function registerSelf() {
+    const cur = crdt.get(DragonCRDT.USERS, collabClient);
+    if (!cur || cur.name !== collabUser.name || cur.color !== collabUser.color) {
+      crdt.set(DragonCRDT.USERS, collabClient, { name: collabUser.name, color: collabUser.color });
+    }
+  }
+  function userInfo(client) {
+    if (client === SEED) return { name: 'Starter template', color: '#64748b' };
+    const u = crdt.get(DragonCRDT.USERS, client);
+    if (u && typeof u.name === 'string') {
+      return { name: u.name.slice(0, 24), color: /^#[0-9a-f]{3,8}$/i.test(u.color || '') ? u.color : '#94a3b8' };
+    }
+    return { name: 'Unknown', color: '#94a3b8' };
+  }
+
+  // ---------- "Who wrote this?" gutter ----------
+  function renderAuthorGutter() {
+    const legend = document.getElementById('authorLegend');
+    if (!authorsOn || !editorFid) { legend.hidden = true; return; }
+    const authors = crdt.lineAuthors(editorFid);
+    // Legend: each person's share of the file's characters (the gutter shows each
+    // line's main author, so someone who typed part of a line still gets credit here).
+    const totals = new Map();
+    const seq = crdt.seqs.get(editorFid);
+    if (seq) for (let it = seq.head.next; it; it = it.next) if (!it.deleted && it.ch !== '\n') totals.set(it.client, (totals.get(it.client) || 0) + 1);
+    lines.innerHTML = authors.map((client, i) => {
+      const info = client ? userInfo(client) : null;
+      return '<span class="ln-author" style="--author:' + (info ? info.color : 'transparent') + '" title="Line ' + (i + 1) + ': ' +
+        escapeHTML(info ? 'written by ' + info.name : 'empty line') + '">' + (i + 1) + '</span>';
+    }).join('');
+    syncScroll();
+    const total = Array.from(totals.values()).reduce((a, b) => a + b, 0) || 1;
+    legend.innerHTML = '<span class="al-title">Who wrote this file</span>' + Array.from(totals).sort((a, b) => b[1] - a[1]).map(([client, n]) => {
+      const u = userInfo(client);
+      const pct = n * 100 / total;
+      return '<span class="al-item"><i style="background:' + u.color + '"></i>' + escapeHTML(u.name) + ' <small>' + (pct < 1 ? '<1' : Math.round(pct)) + '% of the text</small></span>';
+    }).join('');
+    legend.hidden = false;
+  }
+  document.getElementById('authorsBtn').addEventListener('click', () => {
+    authorsOn = !authorsOn;
+    document.getElementById('authorsBtn').classList.toggle('on', authorsOn);
+    updateEditor();
+    status.textContent = authorsOn ? 'Line numbers are coloured by who wrote each line. Hover a number to see the name.' : 'Author colours hidden.';
+  });
+
+  // ---------- green highlight for text that arrived in a merge ----------
+  const mergeMarks = new Map();   // fileId -> { ids: Set of character IDs, until: time }
+  function markMerged(ops) {
+    const until = Date.now() + 8000;
+    for (const op of ops) {
+      if (op.k !== 'ins' || op.c === SEED) continue;
+      let entry = mergeMarks.get(op.f);
+      if (!entry) { entry = { ids: new Set(), until }; mergeMarks.set(op.f, entry); }
+      entry.until = until;
+      for (let j = 0; j < op.x.length; j++) entry.ids.add(op.c + ':' + (op.s + j));
+    }
+    setTimeout(renderRemoteCursors, 8100);
+  }
+  function mergedRanges(fid) {
+    const entry = mergeMarks.get(fid);
+    if (!entry) return [];
+    if (Date.now() > entry.until) { mergeMarks.delete(fid); return []; }
+    const seq = crdt.seqs.get(fid);
+    const runs = [];
+    if (!seq) return runs;
+    let idx = 0, start = -1;
+    for (let it = seq.head.next; it; it = it.next) {
+      if (it.deleted) continue;
+      if (entry.ids.has(it.id)) { if (start < 0) start = idx; }
+      else if (start >= 0) { runs.push([start, idx]); start = -1; }
+      idx++;
+    }
+    if (start >= 0) runs.push([start, idx]);
+    return runs;
+  }
+
+  // ---------- follow a teammate: jump to their cursor ----------
+  function jumpToPeer(client) {
+    const peer = collabPeers.get(client);
+    const st = peer && peer.state;
+    if (!st || !st.fid || !fidToPath.has(st.fid)) return;
+    if (st.fid !== editorFid) openProjectFile(fidToPath.get(st.fid));
+    const index = st.h ? crdt.indexAt(editorFid, st.h) : null;
+    if (index != null) {
+      const row = editor.value.slice(0, index).split('\n').length - 1;
+      editor.scrollTop = Math.max(0, row * editorMetrics().lineHeight - editor.clientHeight / 3);
+      syncScroll();
+    }
+    renderRemoteCursors();
+    status.textContent = 'Jumped to ' + st.name + '’s cursor in ' + fidToPath.get(st.fid) + '.';
+  }
+
+  // ---------- undo that survives a reload (per tab) ----------
+  const UNDO_KEY = 'dragonUndo:' + collabRoom;
+  let undoSaveTimer = null;
+  function saveUndoNow() { try { sessionStorage.setItem(UNDO_KEY, JSON.stringify(undoMgr.toJSON())); } catch (e) {} }
+  function scheduleUndoSave() { clearTimeout(undoSaveTimer); undoSaveTimer = setTimeout(saveUndoNow, 400); }
+  crdt.onChange((ops, origin) => { if (origin === 'local') scheduleUndoSave(); });
+  window.addEventListener('pagehide', saveUndoNow);
+
+  // ---------- version history ----------
+  function checkpoints() {
+    const r = crdt.reg.get(DragonCRDT.HISTORY);
+    const out = [];
+    if (!r) return out;
+    for (const [id, e] of r) {
+      const v = e.v;
+      if (v && typeof v === 'object' && v.sv && typeof v.sv === 'object') {
+        out.push({ id, name: String(v.name || 'Checkpoint').slice(0, 80), at: Number(v.at) || 0, by: String(v.by || '').slice(0, 24), auto: !!v.auto, sv: v.sv });
+      }
+    }
+    return out.sort((a, b) => b.at - a.at);
+  }
+  function createCheckpoint(name, auto) {
+    saveActiveEditorToProject();
+    const id = 'cp' + collabClient + Date.now().toString(36);
+    crdt.set(DragonCRDT.HISTORY, id, { name: String(name).slice(0, 80), at: Date.now(), by: collabUser.name, auto: !!auto, sv: Object.assign({}, crdt.sv) });
+    return id;
+  }
+  function timeAgo(ms) {
+    const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    if (s < 60) return 'just now';
+    if (s < 3600) return Math.round(s / 60) + ' min ago';
+    if (s < 86400) return Math.round(s / 3600) + ' h ago';
+    return new Date(ms).toLocaleString();
+  }
+
+  // Line diff (longest common subsequence) between a checkpoint and now.
+  function lineDiff(oldText, newText) {
+    const a = oldText.split('\n'), b = newText.split('\n');
+    const n = a.length, m = b.length;
+    if (n * m > 4000000) return null;
+    const w = m + 1;
+    const dp = new Uint32Array((n + 1) * w);
+    for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) {
+      dp[i * w + j] = a[i] === b[j] ? dp[(i + 1) * w + j + 1] + 1 : Math.max(dp[(i + 1) * w + j], dp[i * w + j + 1]);
+    }
+    const out = [];
+    let i = 0, j = 0;
+    while (i < n && j < m) {
+      if (a[i] === b[j]) { out.push([' ', a[i]]); i++; j++; }
+      else if (dp[(i + 1) * w + j] >= dp[i * w + j + 1]) out.push(['-', a[i++]]);
+      else out.push(['+', b[j++]]);
+    }
+    while (i < n) out.push(['-', a[i++]]);
+    while (j < m) out.push(['+', b[j++]]);
+    return out;
+  }
+
+  const historyPanel = document.getElementById('historyPanel');
+  let historySelected = null, historyFile = null, historyTimer = null;
+  function openHistory() {
+    saveActiveEditorToProject();
+    historySelected = (checkpoints()[0] || {}).id || null;
+    historyFile = editorFid;
+    historyPanel.hidden = false;
+    renderHistory();
+  }
+  function closeHistory() { historyPanel.hidden = true; }
+  function renderHistory() {
+    const list = document.getElementById('histList');
+    list.textContent = '';
+    const cps = checkpoints();
+    if (!cps.length) {
+      const p = document.createElement('p');
+      p.className = 'hist-empty';
+      p.textContent = 'No checkpoints yet. Save one before a risky change or before the demo. DRAGON also saves your offline version automatically before merging it.';
+      list.appendChild(p);
+    }
+    for (const cp of cps) {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'hist-item' + (cp.id === historySelected ? ' active' : '');
+      const title = document.createElement('b'); title.textContent = cp.name;
+      const meta = document.createElement('small'); meta.textContent = (cp.by ? cp.by + ' · ' : '') + timeAgo(cp.at);
+      item.append(title, meta);
+      if (cp.auto) { const badge = document.createElement('span'); badge.className = 'hist-auto'; badge.textContent = 'AUTO'; item.appendChild(badge); }
+      item.addEventListener('click', () => { historySelected = cp.id; renderHistory(); });
+      list.appendChild(item);
+    }
+    renderHistoryPreview();
+  }
+  function renderHistoryPreview() {
+    const host = document.getElementById('histPreview');
+    host.textContent = '';
+    const cp = checkpoints().find(c => c.id === historySelected);
+    if (!cp) { host.innerHTML = '<p class="hist-empty">Pick a checkpoint to see what changed since then.</p>'; return; }
+    const view = crdt.snapshotAt(cp.sv);
+    const fids = Array.from(new Set([...crdt.fileIds(), ...view.fileIds()]));
+    const changes = [];
+    for (const fid of fids) {
+      const then = view.isVisible(fid), now = crdt.isVisible(fid);
+      const name = (now && fidToPath.get(fid)) || view.get(fid, 'name') || 'file';
+      let kind = null;
+      if (then && !now) kind = 'deleted since';
+      else if (!then && now) kind = 'new since';
+      else if (view.text(fid) !== crdt.text(fid) || view.get(fid, 'name') !== crdt.get(fid, 'name') || (view.get(fid, 'data') || '') !== (crdt.get(fid, 'data') || '')) kind = 'changed';
+      if (kind) changes.push({ fid, name, kind });
+    }
+    if (!historyFile || !fids.includes(historyFile)) historyFile = (changes[0] || {}).fid || editorFid;
+
+    const head = document.createElement('div'); head.className = 'hist-pv-head';
+    const title = document.createElement('div');
+    const h = document.createElement('b'); h.textContent = cp.name;
+    const sub = document.createElement('small'); sub.textContent = 'Saved by ' + (cp.by || 'someone') + ', ' + timeAgo(cp.at) + '. Showing what changed since then.';
+    title.append(h, sub);
+    const all = document.createElement('button'); all.type = 'button'; all.className = 'hist-restore-all'; all.textContent = 'Restore whole project';
+    all.disabled = !changes.length;
+    all.addEventListener('click', () => restoreProject(cp));
+    head.append(title, all);
+    host.appendChild(head);
+
+    if (!changes.length) {
+      const p = document.createElement('p'); p.className = 'hist-empty'; p.textContent = 'Nothing has changed since this checkpoint.';
+      host.appendChild(p);
+      return;
+    }
+    const files = document.createElement('div'); files.className = 'hist-files';
+    for (const c of changes) {
+      const chip = document.createElement('button'); chip.type = 'button';
+      chip.className = 'hist-file' + (c.fid === historyFile ? ' active' : '');
+      chip.textContent = c.name + ' · ' + c.kind;
+      chip.addEventListener('click', () => { historyFile = c.fid; renderHistoryPreview(); });
+      files.appendChild(chip);
+    }
+    host.appendChild(files);
+
+    const fid = historyFile;
+    const then = view.isVisible(fid), now = crdt.isVisible(fid);
+    const diff = lineDiff(then ? view.text(fid) : '', now ? crdt.text(fid) : '');
+    const box = document.createElement('div'); box.className = 'hist-diff';
+    if (!diff) {
+      box.textContent = 'This file is too large to compare line by line. You can still restore it.';
+    } else {
+      let added = 0, removed = 0;
+      for (let k = 0; k < diff.length; k++) {
+        const [kind, text] = diff[k];
+        if (kind === '+') added++; else if (kind === '-') removed++;
+        if (kind === ' ') {
+          // Collapse long unchanged stretches, keeping 2 lines of context on each side.
+          let end = k; while (end < diff.length && diff[end][0] === ' ') end++;
+          const runLen = end - k;
+          if (runLen > 6) {
+            const keepHead = k === 0 ? 0 : 2, keepTail = end === diff.length ? 0 : 2;
+            for (let q = k; q < k + keepHead; q++) addDiffLine(box, ' ', diff[q][1]);
+            const gap = document.createElement('div'); gap.className = 'hd-gap'; gap.textContent = '⋯ ' + (runLen - keepHead - keepTail) + ' unchanged lines';
+            box.appendChild(gap);
+            for (let q = end - keepTail; q < end; q++) addDiffLine(box, ' ', diff[q][1]);
+            k = end - 1;
+            continue;
+          }
+        }
+        addDiffLine(box, kind, text);
+      }
+      const stat = document.createElement('p'); stat.className = 'hist-stat';
+      stat.textContent = (fidToPath.get(fid) || view.get(fid, 'name') || 'file') + ': ' + added + ' line' + (added === 1 ? '' : 's') + ' added, ' + removed + ' removed since this checkpoint.';
+      host.appendChild(stat);
+    }
+    host.appendChild(box);
+    const one = document.createElement('button'); one.type = 'button'; one.className = 'hist-restore-one';
+    one.textContent = !then ? 'Remove this file (it did not exist then)' : (!now ? 'Bring this file back' : 'Restore this file');
+    one.addEventListener('click', () => {
+      restoreFiles(cp, [fid]);
+      collabToast('Restored ' + (fidToPath.get(fid) || view.get(fid, 'name') || 'the file') + ' to “' + cp.name + '”. Ctrl+Z in that file undoes it.');
+    });
+    host.appendChild(one);
+  }
+  function addDiffLine(box, kind, text) {
+    const row = document.createElement('div');
+    row.className = 'hd-line ' + (kind === '+' ? 'hd-add' : kind === '-' ? 'hd-del' : 'hd-same');
+    row.textContent = (kind === '+' ? '+ ' : kind === '-' ? '− ' : '  ') + text;
+    box.appendChild(row);
+  }
+
+  // Restoring is an ordinary edit: it syncs to everyone and Ctrl+Z undoes it.
+  function restoreFiles(cp, fids) {
+    saveActiveEditorToProject();
+    const view = crdt.snapshotAt(cp.sv);
+    undoMgr.stopCapturing();
+    const now = Date.now();
+    for (const fid of fids) {
+      if (!view.isVisible(fid)) { if (crdt.isVisible(fid)) crdt.deleteFile(fid); continue; }
+      if (!crdt.isVisible(fid)) crdt.set(fid, 'deleted', false);
+      if (crdt.get(fid, 'name') !== view.get(fid, 'name')) crdt.set(fid, 'name', view.get(fid, 'name'));
+      if ((crdt.get(fid, 'data') || '') !== (view.get(fid, 'data') || '')) crdt.set(fid, 'data', view.get(fid, 'data') || '');
+      for (const op of setFileText(fid, view.text(fid))) undoMgr.track(op, now);
+    }
+    undoMgr.stopCapturing();
+    rebuildProjectView();
+    if (editorFid && crdt.isVisible(editorFid)) {
+      const caret = Math.min(editor.selectionStart, crdt.text(editorFid).length);
+      editor.value = crdt.text(editorFid);
+      editor.setSelectionRange(caret, caret);
+      activePath = fidToPath.get(editorFid);
+      fileNameEl.textContent = activePath + ' · ' + languageNameForMode(modeOfPath(activePath));
+    } else {
+      editorFid = null;
+      const next = openTabs[0] || projectFiles.keys().next().value;
+      activePath = '';
+      if (next) openProjectFile(next, true);
+    }
+    renderAllProjectUi();
+    updateEditor();
+    nativeRunSequence++;
+    if (!isNativeLanguageMode(modeOfPath(activePath))) run();
+    collabAfterLocalEdit();
+    scheduleSave();
+    if (!historyPanel.hidden) renderHistory();
+  }
+  function restoreProject(cp) {
+    if (!confirm('Restore the whole project to “' + cp.name + '”? Everyone in the room will see it. Ctrl+Z in each file undoes it.')) return;
+    const view = crdt.snapshotAt(cp.sv);
+    const fids = Array.from(new Set([...crdt.fileIds(), ...view.fileIds()]));
+    restoreFiles(cp, fids);
+    collabToast('Project restored to “' + cp.name + '”.');
+  }
+
+  document.getElementById('historyBtn').addEventListener('click', openHistory);
+  document.getElementById('histClose').addEventListener('click', closeHistory);
+  historyPanel.addEventListener('click', e => { if (e.target === historyPanel) closeHistory(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && !historyPanel.hidden) closeHistory(); });
+  document.getElementById('histSave').addEventListener('click', () => {
+    const name = prompt('Name this checkpoint (everyone in the room will see it):', 'Before the demo');
+    if (!name || !name.trim()) return;
+    historySelected = createCheckpoint(name.trim(), false);
+    renderHistory();
+    collabToast('Checkpoint “' + name.trim() + '” saved for everyone.');
+  });
+
+  // ---------- room password ----------
+  let roomLocked = false, collabDenied = false, deniedReason = '';
+  let collabPassword = '';
+  try { collabPassword = sessionStorage.getItem('dragonPw:' + collabRoom) || ''; } catch (e) {}
+  function rememberPassword(pw) { collabPassword = pw; try { sessionStorage.setItem('dragonPw:' + collabRoom, pw); } catch (e) {} }
+  function updateLockButton() {
+    const b = document.getElementById('lockRoom');
+    b.textContent = collabDenied ? '🔑 Enter password' : (roomLocked ? '🔒 Room locked' : '🔓 Lock room');
+    b.classList.toggle('on', roomLocked || collabDenied);
+  }
+  function askPassword() {
+    const pw = prompt((deniedReason === 'wrong' ? 'That password was wrong. ' : '') + 'Room “' + collabRoom + '” is locked. Enter the room password:');
+    if (!pw) { updateSyncBadge(); return; }
+    rememberPassword(pw);
+    collabDenied = false; deniedReason = '';
+    wsRetry = 0;
+    connectServer();
+    updateLockButton();
+  }
+  document.getElementById('lockRoom').addEventListener('click', () => {
+    if (collabDenied) { askPassword(); return; }
+    if (!wsOpen) { collabToast('Connect to the sync server first to lock or unlock the room.', 'warn'); return; }
+    const pw = prompt(roomLocked
+      ? 'Room “' + collabRoom + '” is locked. Type a new password, or leave it empty to remove the password:'
+      : 'Set a password for room “' + collabRoom + '”. People already here stay connected; anyone who joins later must type it:', '');
+    if (pw === null) return;
+    rememberPassword(pw);
+    wsSend({ t: 'lock', password: pw });
+  });
+
+  // ---------- self-healing sync: compare state vectors every 20 seconds ----------
+  setInterval(() => { if (wsOpen && !collabOffline) wsSend({ t: 'sync', sv: crdt.sv }); }, 20000);
+
+  // =====================================================================
+  // Shared terminals, Run and Debug
+  //   terminal : runs on the sync server, in a folder that mirrors this project. It belongs
+  //              to the room, so it keeps running when whoever started it closes their tab.
+  //              The server decides who may type (owner + people the owner allows); everyone
+  //              else watches. Input is sent only while connected and is never queued.
+  //   run      : HTML/CSS/JS run in the preview in this browser (offline too). Python, SQL and
+  //              TypeScript run in this browser once their runtime is downloaded. Other
+  //              languages compile on Judge0 (ce.judge0.com). Availability is checked for
+  //              real, not guessed from navigator.onLine.
+  //   debug    : runs a real debugger (pdb, node inspect, gdb, jdb) in a shared terminal on
+  //              the sync server, if the server has terminals turned on and the tool installed.
+  // =====================================================================
+  const termPanel = document.getElementById('terminalPanel');
+  const termOut = document.getElementById('termOut');
+  const termInput = document.getElementById('termInput');
+  const termNote = document.getElementById('termNote');
+  let termNoteFlash = '', termNoteTimer = null;
+  const termHistory = [];
+  let termHistoryPos = 0;
+
+  function connectedNow() { return !!(ws && wsOpen && welcomed && !collabOffline && !collabDenied); }
+  function lowerFirst(text) { return text ? text[0].toLowerCase() + text.slice(1) : text; }
+  function saveTermActive() { try { sessionStorage.setItem('dragonTerm:' + collabRoom, termActive); } catch (e) {} }
+
+  // Why the terminal cannot be used right now ('' when it can).
+  function terminalBlocker() {
+    if (!collabServerUrl) return 'Terminal unavailable: it runs on the DRAGON sync server, and this page was opened as a file without one.';
+    if (termCaps && !termCaps.terminal) return 'Terminal unavailable: ' + lowerFirst(termCaps.reason) + ' Start the server with DRAGON_TERMINAL=1 to turn on shared terminals.';
+    if (!connectedNow()) return 'Connection required: the terminal runs on the sync server. Nothing you type is queued.';
+    if (!termCaps) return 'Checking what the sync server offers…';
+    return '';
+  }
+  function myTermRole(term) {
+    if (!term) return 'view';
+    if (term.owner === myUserId()) return 'owner';
+    return term.perms && term.perms[myUserId()] === 'interactive' ? 'interactive' : 'view';
+  }
+  function activeTerm() { return termList.find(t => t.id === termActive) || null; }
+  function termInputState() {
+    const blocker = terminalBlocker();
+    if (blocker) return { ok: false, why: blocker };
+    if (Date.now() - lastHeard > 6000) return { ok: false, why: 'Connection lost: reconnecting… Nothing you type is queued.' };
+    const term = activeTerm();
+    if (!term) return { ok: false, why: termList.length ? 'Pick a terminal above.' : 'No terminal yet. Click ＋ New terminal to start one in the project folder.' };
+    if (termAttachedOn !== ws) return { ok: false, why: 'Re-attaching to ' + term.title + '…' };
+    if (term.status !== 'running') return { ok: false, why: term.title + ' has ended' + (term.exitCode != null ? ' (exit code ' + term.exitCode + ')' : '') + '.' };
+    if (myTermRole(term) === 'view') return { ok: false, why: 'View only: ' + term.ownerName + ' can give you typing access.' };
+    return { ok: true, why: '' };
+  }
+
+  function termEnsureAttached() {
+    if (!connectedNow() || !termCaps || !termCaps.terminal) return;
+    if (!termList.some(t => t.id === termActive)) {
+      if (termPanel.hidden) return;
+      const first = termList.find(t => t.status === 'running') || termList[0];
+      if (!first) return;
+      termActive = first.id;
+      saveTermActive();
+    }
+    if (termAttachedOn === ws) return;
+    termAttachedOn = ws;
+    wsSend({ t: 'term-attach', id: termActive });
+  }
+
+  function termSetOutput(text) {
+    termOut.textContent = text;
+    termOut.scrollTop = termOut.scrollHeight;
+  }
+  function termAppend(text) {
+    const stick = termOut.scrollTop + termOut.clientHeight >= termOut.scrollHeight - 30;
+    termOut.appendChild(document.createTextNode(text));
+    if (termOut.textContent.length > 220000) termOut.textContent = termOut.textContent.slice(-200000);
+    if (stick) termOut.scrollTop = termOut.scrollHeight;
+  }
+  function flashTermNote(text) {
+    termNoteFlash = text;
+    clearTimeout(termNoteTimer);
+    termNoteTimer = setTimeout(() => { termNoteFlash = ''; renderTerminal(); }, 7000);
+    renderTerminal();
+  }
+
+  function handleTerminalMessage(msg) {
+    if (msg.t === 'pong') return;
+    if (msg.t === 'term-list') {
+      termCaps = msg.caps || termCaps;
+      termList = Array.isArray(msg.terms) ? msg.terms : [];
+      termMembers = Array.isArray(msg.members) ? msg.members : [];
+      if (termActive && !termList.some(t => t.id === termActive)) {
+        if (termAttachedOn) termSetOutput('');
+        termActive = ''; termAttachedOn = null; saveTermActive();
+      }
+      termEnsureAttached();
+      updateRuntimeUi();
+      renderTerminal();
+    } else if (msg.t === 'term-snapshot') {
+      termActive = msg.id; termAttachedOn = ws; saveTermActive();
+      termSetOutput(msg.data || '');
+      renderTerminal();
+    } else if (msg.t === 'term-out') {
+      if (msg.id === termActive) termAppend(msg.data || '');
+    } else if (msg.t === 'term-denied') {
+      flashTermNote(msg.reason || 'Refused by the server. Nothing was run.');
+      if (!msg.id) collabToast(msg.reason || 'The server refused to start that.', 'warn');
+    }
+  }
+
+  function renderTerminal() {
+    const term = activeTerm();
+    const role = myTermRole(term);
+    const tabs = document.getElementById('termTabs');
+    tabs.textContent = '';
+    for (const t of termList) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'term-tab' + (t.id === termActive ? ' active' : '') + (t.status === 'running' ? ' running' : ' exited');
+      b.setAttribute('role', 'tab');
+      b.setAttribute('aria-selected', t.id === termActive ? 'true' : 'false');
+      b.title = t.title + ' · started by ' + t.ownerName + (t.status === 'running' ? ' · running' : ' · ended');
+      const name = document.createElement('span'); name.textContent = t.title;
+      const by = document.createElement('small'); by.textContent = t.ownerName;
+      b.append(name, by);
+      b.addEventListener('click', () => {
+        if (t.id === termActive && termAttachedOn === ws) return;
+        termActive = t.id; termAttachedOn = null; saveTermActive();
+        termSetOutput('');
+        termEnsureAttached();
+        renderTerminal();
+      });
+      tabs.appendChild(b);
+    }
+    const blocker = terminalBlocker();
+    document.getElementById('termNew').disabled = !!blocker;
+    const roleChip = document.getElementById('termRole');
+    roleChip.textContent = !term ? '' : role === 'owner' ? 'You started this · can type' : role === 'interactive' ? 'You can type' : 'View only';
+    roleChip.className = 'term-role ' + (term ? role : '');
+    const isOwner = role === 'owner' && !!term;
+    document.getElementById('termAccess').hidden = !isOwner;
+    document.getElementById('termEnd').hidden = !isOwner;
+    const state = termInputState();
+    termInput.disabled = !state.ok;
+    document.getElementById('termSend').disabled = !state.ok;
+    document.getElementById('termStop').disabled = !state.ok;
+    termInput.placeholder = state.ok ? (term && term.kind === 'debug' ? 'Debugger command, e.g. n, s, p x, c' : 'Type a command and press Enter') : state.why;
+    termNote.textContent = termNoteFlash || (state.ok ? '' : state.why);
+    termNote.className = 'term-note' + (termNoteFlash ? ' flash' : '');
+    const access = document.getElementById('termAccessList');
+    if (!isOwner) access.hidden = true;
+    if (!access.hidden && isOwner) renderTermAccess(term);
+    const btn = document.getElementById('terminalBtn');
+    btn.classList.toggle('on', !termPanel.hidden);
+    btn.title = blocker || 'Shared terminal on the sync server, in the project folder';
+  }
+
+  function renderTermAccess(term) {
+    const access = document.getElementById('termAccessList');
+    access.textContent = '';
+    const head = document.createElement('p');
+    head.textContent = 'Who may type in ' + term.title + ' (everyone in the room can watch):';
+    access.appendChild(head);
+    const others = termMembers.filter(m => m.userId !== term.owner);
+    if (!others.length) { const p = document.createElement('p'); p.className = 'muted'; p.textContent = 'Nobody else is here yet.'; access.appendChild(p); }
+    for (const m of others) {
+      const row = document.createElement('label');
+      row.className = 'term-access-row';
+      const name = document.createElement('span');
+      name.textContent = m.name + (m.online ? '' : ' (offline)');
+      const select = document.createElement('select');
+      select.dataset.user = m.userId;
+      select.setAttribute('aria-label', 'Access for ' + m.name);
+      for (const [value, label] of [['view', 'View only'], ['interactive', 'Can type']]) {
+        const o = document.createElement('option'); o.value = value; o.textContent = label; select.appendChild(o);
+      }
+      select.value = term.perms && term.perms[m.userId] === 'interactive' ? 'interactive' : 'view';
+      select.addEventListener('change', () => wsSend({ t: 'term-perm', id: term.id, user: m.userId, role: select.value }));
+      row.append(name, select);
+      access.appendChild(row);
+    }
+  }
+
+  function openTerminalPanel() {
+    termPanel.hidden = false;
+    document.body.classList.add('term-open');
+    termEnsureAttached();
+    renderTerminal();
+    if (!termInput.disabled) termInput.focus();
+  }
+  document.getElementById('terminalBtn').addEventListener('click', () => {
+    if (termPanel.hidden) openTerminalPanel();
+    else { termPanel.hidden = true; document.body.classList.remove('term-open'); renderTerminal(); }
+  });
+  document.getElementById('termHide').addEventListener('click', () => { termPanel.hidden = true; document.body.classList.remove('term-open'); renderTerminal(); });
+  document.getElementById('termNew').addEventListener('click', () => {
+    const blocker = terminalBlocker();
+    if (blocker) { flashTermNote(blocker); return; }
+    wsSend({ t: 'term-new', kind: 'shell' });
+  });
+  document.getElementById('termAccess').addEventListener('click', () => {
+    const access = document.getElementById('termAccessList');
+    access.hidden = !access.hidden;
+    renderTerminal();
+  });
+  document.getElementById('termEnd').addEventListener('click', () => {
+    const term = activeTerm();
+    if (!term || !confirm('End ' + term.title + ' for everyone? Its running program is stopped.')) return;
+    wsSend({ t: 'term-close', id: term.id });
+  });
+  function sendTermInterrupt() {
+    const state = termInputState();
+    if (!state.ok) { flashTermNote('Not sent: ' + state.why); return; }
+    wsSend({ t: 'term-input', id: termActive, signal: 'INT' });
+  }
+  document.getElementById('termStop').addEventListener('click', sendTermInterrupt);
+  document.getElementById('termForm').addEventListener('submit', e => {
+    e.preventDefault();
+    const state = termInputState();
+    if (!state.ok) { flashTermNote('Not sent: ' + state.why); return; }   // never queued
+    const line = termInput.value;
+    wsSend({ t: 'term-input', id: termActive, data: line + '\n' });
+    if (line.trim()) termHistory.push(line);
+    termHistoryPos = termHistory.length;
+    termInput.value = '';
+  });
+  termInput.addEventListener('keydown', e => {
+    if (e.key === 'c' && (e.ctrlKey || e.metaKey) && termInput.selectionStart === termInput.selectionEnd) { e.preventDefault(); sendTermInterrupt(); }
+    else if (e.key === 'ArrowUp' && termHistoryPos > 0) { e.preventDefault(); termInput.value = termHistory[--termHistoryPos]; }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); termHistoryPos = Math.min(termHistory.length, termHistoryPos + 1); termInput.value = termHistory[termHistoryPos] || ''; }
+  });
+  // While attached, check in every 2 s: keeps the late-input baseline fresh on the server
+  // and lets this tab notice quickly when the connection stops answering.
+  setInterval(() => {
+    if (connectedNow() && termAttachedOn === ws) wsSend({ t: 'ping' });
+    if (!termPanel.hidden) renderTerminal();
+  }, 2000);
+
+  // ---------- Run and Debug availability ----------
+  const reach = { judge0: null, cdn: null };          // null = not checked yet
+  const reachAt = { judge0: 0, cdn: 0 }, probing = {};
+  const PROBE_URL = { judge0: 'https://ce.judge0.com/about', cdn: 'https://cdn.jsdelivr.net/npm/sql.js@1.15.1/package.json' };
+  function probe(name, force) {
+    if (!navigator.onLine) { reach[name] = false; reachAt[name] = Date.now(); return; }
+    if (probing[name] || (!force && reach[name] !== null && Date.now() - reachAt[name] < 30000)) return;
+    probing[name] = true;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 5000);
+    fetch(PROBE_URL[name], { method: 'HEAD', mode: 'no-cors', cache: 'no-store', signal: ctl.signal })
+      .then(() => { reach[name] = true; }, () => { reach[name] = false; })
+      .finally(() => { clearTimeout(timer); probing[name] = false; reachAt[name] = Date.now(); updateRuntimeUi(); });
+  }
+  window.addEventListener('online', () => { probe('judge0', true); probe('cdn', true); });
+  window.addEventListener('offline', () => { reach.judge0 = false; reach.cdn = false; updateRuntimeUi(); });
+
+  const WEB_RUNTIMES = { python: 'Pyodide (Python for WebAssembly)', sql: 'sql.js (SQLite for WebAssembly)', typescript: 'the TypeScript compiler' };
+  function runAvailability(mode) {
+    const lang = languageNameForMode(mode);
+    if (mode === 'html' || mode === 'css' || mode === 'js') return { ok: true, kind: 'ok', chip: 'Run: in browser', detail: lang + ' runs in the live preview in this browser. Works offline.' };
+    if (!isNativeLanguageMode(mode)) return { ok: false, kind: 'off', chip: 'Run unavailable', detail: 'This file type has nothing to run.' };
+    if (WEB_RUNTIMES[mode]) {
+      const rt = WEB_RUNTIMES[mode];
+      const loaded = mode === 'python' ? localPythonLoaded : mode === 'sql' ? !!sqlDatabase : !!(window.ts && window.ts.transpileModule);
+      if (loaded) return { ok: true, kind: 'ok', chip: 'Run: in browser', detail: lang + ' runs in this browser with ' + rt + ', already loaded in this tab, so it also works offline.' };
+      probe('cdn');
+      if (reach.cdn === true) return { ok: true, kind: 'ok', chip: 'Run: in browser', detail: lang + ' runs in this browser. The first run downloads ' + rt + ' from cdn.jsdelivr.net.' };
+      if (reach.cdn === null) return { ok: true, kind: 'checking', chip: 'Run: checking…', detail: 'Checking whether cdn.jsdelivr.net (the ' + lang + ' runtime) is reachable…' };
+      return { ok: false, kind: 'need', chip: 'Connection required to run', detail: lang + ' runs in this browser, but ' + rt + ' must first be downloaded from cdn.jsdelivr.net, which this device cannot reach right now.' };
+    }
+    probe('judge0');
+    if (reach.judge0 === true) return { ok: true, kind: 'ok', chip: 'Run: Judge0 online', detail: lang + ' compiles and runs on the Judge0 service (ce.judge0.com).' };
+    if (reach.judge0 === null) return { ok: true, kind: 'checking', chip: 'Run: checking…', detail: 'Checking whether the Judge0 compiler service (ce.judge0.com) is reachable…' };
+    return { ok: false, kind: 'need', chip: 'Connection required to run', detail: lang + ' compiles and runs on the Judge0 service at ce.judge0.com, which this device cannot reach right now.' };
+  }
+
+  const DEBUG_MODES = { python: 'python', js: 'js', c: 'c', cpp: 'cpp', java: 'java' };
+  function debugAvailability(mode) {
+    const lang = languageNameForMode(mode);
+    const dm = DEBUG_MODES[mode];
+    const ext = extensionOf(activePath);
+    if (mode === 'html' || mode === 'css') return { ok: false, kind: 'off', chip: 'Debug unavailable', detail: 'Debug unavailable: ' + lang + ' has no program to step through. Use the live preview (and your browser’s DevTools, F12, for page scripts).' };
+    if (!dm || (mode === 'c' && ext !== 'c') || (mode === 'cpp' && !['cpp', 'cc', 'cxx'].includes(ext))) return { ok: false, kind: 'off', chip: 'Debug unavailable', detail: 'Debug unavailable: DRAGON has no debugger for ' + (activePath ? baseName(activePath) : lang) + '. Supported: Python (pdb), JavaScript (node inspect), C/C++ (gdb), Java (jdb).' };
+    if (!collabServerUrl) return { ok: false, kind: 'off', chip: 'Debug unavailable', detail: 'Debug unavailable: debuggers run on the DRAGON sync server, and this page was opened as a file without one.' };
+    if (termCaps && !termCaps.terminal) return { ok: false, kind: 'off', chip: 'Debug unavailable · needs DRAGON_TERMINAL=1', detail: 'Debug unavailable: ' + lowerFirst(termCaps.reason) + ' Debuggers run in a shared terminal on the server.' };
+    if (!connectedNow()) return { ok: false, kind: 'need', chip: 'Connection required to debug', detail: 'Connection required to debug: ' + lang + ' is debugged on the sync server. Editing and saving keep working.' };
+    if (!termCaps) return { ok: false, kind: 'checking', chip: 'Debug: checking…', detail: 'Checking what the sync server offers…' };
+    const d = termCaps.debuggers && termCaps.debuggers[dm];
+    if (!d) return { ok: false, kind: 'off', chip: 'Debug unavailable', detail: 'Debug unavailable: the sync server has no debugger for ' + lang + '.' };
+    if (!d.ok) return { ok: false, kind: 'off', chip: 'Debug unavailable · needs ' + d.missing.join(' + '), detail: 'Debug unavailable: ' + d.missing.join(' and ') + (d.missing.length === 1 ? ' is' : ' are') + ' not installed on the sync server.' };
+    return { ok: true, kind: 'ok', chip: 'Debug: ' + d.label + ' on server', detail: 'Debug ' + baseName(activePath) + ' with ' + d.label + ' in a shared terminal on the sync server.' + (mode === 'js' ? ' (Node.js: for code that uses the page, use the browser’s DevTools.)' : '') };
+  }
+
+  let lastRunKey = '';
+  function setChip(id, av) {
+    const chip = document.getElementById(id);
+    if (!chip) return;
+    chip.textContent = av.chip;
+    chip.className = 'rt-chip ' + av.kind;
+    chip.title = av.detail;
+  }
+  function updateRuntimeUi() {
+    const mode = modeOfPath(activePath);
+    const r = runAvailability(mode), d = debugAvailability(mode);
+    const runBtn = document.getElementById('run'), dbgBtn = document.getElementById('debugBtn');
+    runBtn.disabled = !r.ok; runBtn.title = r.detail;
+    dbgBtn.disabled = !d.ok; dbgBtn.title = d.detail;
+    setChip('runState', r); setChip('debugState', d);
+    const key = activePath + '|' + r.ok + '|' + r.kind;
+    if (key !== lastRunKey) { lastRunKey = key; if (isNativeLanguageMode(mode)) run(); }
+  }
+  document.getElementById('debugBtn').addEventListener('click', () => {
+    const d = debugAvailability(modeOfPath(activePath));
+    if (!d.ok) { status.textContent = d.detail; return; }
+    saveActiveEditorToProject();
+    const fid = editorFid;
+    openTerminalPanel();
+    // after the edit above has gone out, so the server debugs the latest code
+    setTimeout(() => wsSend({ t: 'term-new', kind: 'debug', fid }), 0);
+    status.textContent = 'Starting ' + d.chip.replace(/^Debug: /, '') + ' for ' + baseName(activePath) + '…';
+  });
+
+  // =====================================================================
+  // Accounts, the login page, and Settings (bottom of the Explorer)
+  //   account : name + email + password, kept by the sync server (accounts.js). The page
+  //             shows "Create account" the first time and "Log in" after that. The session
+  //             token stays in this browser, so reloads (offline too) open the editor
+  //             directly. The server refuses room access without a valid login.
+  //   local   : opened as a file with no sync server, accounts are impossible, so only a
+  //             name is kept in this browser (the editor still works, tabs still sync).
+  //   theme   : one of THEMES on <html data-theme>, remembered here and on the account.
+  // =====================================================================
+  const COLOR_NAMES = { '#f97316': 'Orange', '#22c55e': 'Green', '#38bdf8': 'Sky blue', '#f43f5e': 'Rose', '#a78bfa': 'Violet', '#2dd4bf': 'Teal', '#facc15': 'Yellow', '#f472b6': 'Pink' };
+  const EMAIL_PATTERN = /^[^\s@]+@[^\s@.]+(\.[^\s@.]+)+$/;
+  const initials = name => String(name || '').trim().split(/\s+/).map(w => w[0] || '').join('').slice(0, 2).toUpperCase() || '?';
+  const cleanName = value => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 24);
+  function myUserId() { return collabAuth ? 'acct-' + collabAuth.user.id : collabIdentity.id; }
+  function lastEmail() { try { return localStorage.getItem('dragonLastEmail') || ''; } catch (e) { return ''; } }
+
+  // ---------- talking to the account API on the sync server ----------
+  function apiBase() {
+    if (!collabServerUrl) return '';
+    try {
+      const u = new URL(collabServerUrl);
+      u.protocol = u.protocol === 'wss:' ? 'https:' : 'http:';
+      u.pathname = u.pathname.replace(/\/ws\/?$/, '/');
+      u.search = ''; u.hash = '';
+      return u.href.replace(/\/$/, '');
+    } catch (e) { return ''; }
+  }
+  async function api(path, { method = 'GET', body, token, timeout = 15000 } = {}) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeout);
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (token) headers.Authorization = 'Bearer ' + token;
+      const res = await fetch(apiBase() + path, { method, headers, body: body ? JSON.stringify(body) : undefined, cache: 'no-store', signal: ctl.signal });
+      let data = null;
+      try { data = await res.json(); } catch (e) {}
+      if (!res.ok) { const err = new Error((data && data.error) || ('The server answered HTTP ' + res.status + '.')); err.status = res.status; throw err; }
+      return data;
+    } finally { clearTimeout(timer); }
+  }
+  const connectionNeeded = action => 'Connection required to ' + action + ': the DRAGON server can’t be reached right now. Check your internet and try again.';
+
+  function renderSettingsButton() {
+    const avatar = document.getElementById('settingsAvatar');
+    avatar.textContent = initials(collabUser.name);
+    avatar.style.background = collabUser.color;
+    document.getElementById('settingsName').textContent = collabUser.name;
+  }
+  function radioPick(host, chosen) {
+    for (const x of host.children) x.setAttribute('aria-checked', x === chosen ? 'true' : 'false');
+  }
+  function renderColorChoices(host, selected, onPick) {
+    host.textContent = '';
+    for (const color of COLLAB_COLORS) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'color-swatch';
+      b.style.setProperty('--sw', color);
+      b.setAttribute('role', 'radio');
+      b.setAttribute('aria-checked', color === selected ? 'true' : 'false');
+      b.setAttribute('aria-label', COLOR_NAMES[color] || color);
+      b.title = COLOR_NAMES[color] || color;
+      b.addEventListener('click', () => { radioPick(host, b); onPick(color); });
+      host.appendChild(b);
+    }
+  }
+  function renderThemeChoices(host, onPick) {
+    host.textContent = '';
+    for (const [id, label] of THEMES) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'theme-card';
+      b.dataset.t = id;
+      b.setAttribute('role', 'radio');
+      b.setAttribute('aria-checked', id === currentTheme ? 'true' : 'false');
+      const preview = document.createElement('span');
+      preview.className = 'theme-prev';
+      preview.setAttribute('aria-hidden', 'true');
+      const name = document.createElement('span');
+      name.className = 'theme-name';
+      name.textContent = label;
+      b.append(preview, name);
+      b.addEventListener('click', () => { radioPick(host, b); onPick(id); });
+      host.appendChild(b);
+    }
+  }
+  // A theme applies at once; it is also saved on the account so it follows you to other devices.
+  function chooseTheme(id, saveToAccount = true) {
+    currentTheme = applyTheme(id);
+    try { localStorage.setItem('dragonTheme', currentTheme); } catch (e) {}
+    if (saveToAccount && collabAuth && collabAuth.user.theme !== currentTheme) {
+      collabAuth.user.theme = currentTheme;
+      saveAuth(collabAuth);
+      api('/api/me', { method: 'PATCH', token: collabAuth.token, body: { theme: currentTheme } }).catch(() => {});
+    }
+  }
+  // Keep keyboard focus inside an open dialog: everything else becomes inert.
+  function setAppInert(on, keep) {
+    for (const el of document.body.children) {
+      if (el === keep || el.id === 'toastHost' || el.tagName === 'SCRIPT') continue;
+      el.inert = !!on;
+    }
+  }
+  // Show a name and colour everywhere at once: people list, cursor label, "who wrote this".
+  function applyProfileLocal(name, color) {
+    collabUser.name = name;
+    if (COLLAB_COLORS.includes(color)) collabUser.color = color;
+    saveCollabUser(true);
+    registerSelf();
+    renderPeople();
+    sendAwareness();
+    if (authorsOn) updateEditor();
+    renderSettingsButton();
+  }
+  // The server's copy of the account wins (for example after a rename on another device).
+  function accountFromServer(user) {
+    if (!user || !collabAuth || user.id !== collabAuth.user.id) return;
+    const changed = user.name !== collabAuth.user.name || user.color !== collabAuth.user.color;
+    collabAuth.user = Object.assign({}, collabAuth.user, user);
+    saveAuth(collabAuth);
+    if (changed) applyProfileLocal(user.name, user.color);
+  }
+  function sessionEnded(message) {
+    clearAuth();
+    disconnectServer();
+    updateSyncBadge();
+    closeSettings();
+    showAuth('login', message);
+  }
+
+  // ---------- the login page ----------
+  const authScreen = document.getElementById('authScreen');
+  const authName = document.getElementById('authName');
+  const authEmail = document.getElementById('authEmail');
+  const authPassword = document.getElementById('authPassword');
+  const authError = document.getElementById('authError');
+  const authSubmit = document.getElementById('authSubmit');
+  let authMode = 'signup', authBusy = false;
+  const AUTH_TEXT = {
+    signup: { title: 'Create your account', sub: 'Sign up once, then log in from any device.', go: 'Create account →' },
+    login: { title: 'Welcome back', sub: 'Log in to start coding.', go: 'Log in →' },
+    local: { title: 'Continue in this browser', sub: 'This page was opened as a file, so there is no DRAGON server to keep accounts. Your name is kept in this browser only.', go: 'Continue →' }
+  };
+  function setAuthMode(mode, message) {
+    authMode = mode;
+    const local = mode === 'local';
+    document.getElementById('authTabs').hidden = local;
+    document.getElementById('authTabSignup').setAttribute('aria-selected', String(mode === 'signup'));
+    document.getElementById('authTabLogin').setAttribute('aria-selected', String(mode === 'login'));
+    document.getElementById('authNameField').hidden = mode === 'login';
+    document.getElementById('authEmailField').hidden = local;
+    document.getElementById('authPasswordField').hidden = local;
+    document.getElementById('authRememberRow').hidden = local;
+    authPassword.autocomplete = mode === 'login' ? 'current-password' : 'new-password';
+    authPassword.placeholder = mode === 'login' ? 'Your password' : 'At least 8 characters';
+    const text = AUTH_TEXT[mode];
+    document.getElementById('authTitle').textContent = text.title;
+    const joining = COLLAB_PARAMS.get('room') && !local ? 'You are joining project ' + collabRoom + '. ' : '';
+    document.getElementById('authSub').textContent = joining + text.sub;
+    document.getElementById('authNote').textContent = local
+      ? 'To use accounts, run the sync server (npm start) or set one with ⚙ Server.'
+      : 'Your password is never stored, only a scrypt hash of it on the DRAGON server.';
+    authSubmit.textContent = text.go;
+    authError.textContent = message || '';
+  }
+  function focusFirstAuthField() {
+    const target = authMode === 'login' ? (authEmail.value ? authPassword : authEmail) : authName;
+    target.focus();
+  }
+  function showAuth(mode, message) {
+    setAuthMode(mode, message);
+    if (mode !== 'login' && !authName.value) authName.value = COLLAB_PARAMS.get('name') || (collabProfile && collabProfile.name) || '';
+    if (!authEmail.value) authEmail.value = lastEmail();
+    authScreen.hidden = false;
+    setAppInert(true, authScreen);
+    setTimeout(focusFirstAuthField, 0);
+  }
+  function hideAuth() {
+    authScreen.hidden = true;
+    setAppInert(false);
+  }
+  function switchAuthMode(mode) {
+    if (authBusy || mode === authMode) return;
+    setAuthMode(mode);
+    focusFirstAuthField();
+  }
+  document.getElementById('authTabSignup').addEventListener('click', () => switchAuthMode('signup'));
+  document.getElementById('authTabLogin').addEventListener('click', () => switchAuthMode('login'));
+  document.getElementById('authShowPw').addEventListener('click', e => {
+    const show = authPassword.type === 'password';
+    authPassword.type = show ? 'text' : 'password';
+    e.currentTarget.setAttribute('aria-pressed', String(show));
+    e.currentTarget.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+    e.currentTarget.title = show ? 'Hide password' : 'Show password';
+    authPassword.focus();
+  });
+  function completeLogin(data, remember, isNew) {
+    collabAuth = { token: data.token, user: data.user, remember };
+    saveAuth(collabAuth);
+    try { localStorage.setItem('dragonLastEmail', data.user.email); } catch (e) {}
+    authPassword.value = '';
+    authPassword.type = 'password';
+    if (data.user.theme && data.user.theme !== currentTheme) chooseTheme(data.user.theme, false);
+    applyProfileLocal(data.user.name, data.user.color);
+    hideAuth();
+    collabDenied = false; deniedReason = '';
+    updateLockButton();
+    wsRetry = 0;
+    connectServer();
+    updateSyncBadge();
+    collabToast(isNew ? 'Welcome, ' + data.user.name + '! Your account is ready.' : 'Welcome back, ' + data.user.name + '!');
+    editor.focus();
+  }
+  document.getElementById('authForm').addEventListener('submit', async e => {
+    e.preventDefault();
+    if (authBusy) return;
+    const name = cleanName(authName.value);
+    const email = authEmail.value.trim().toLowerCase();
+    const password = authPassword.value;
+    const fail = (message, field) => { authError.textContent = message; if (field) field.focus(); };
+    if (authMode === 'local') {
+      if (!name) return fail('Please enter your name to continue.', authName);
+      collabProfile = { name, color: collabUser.color };
+      try { localStorage.setItem('dragonProfile', JSON.stringify(collabProfile)); } catch (err) {}
+      applyProfileLocal(name, collabUser.color);
+      hideAuth();
+      collabToast('Welcome, ' + name + '! Your name is saved in this browser.');
+      return;
+    }
+    if (authMode === 'signup' && !name) return fail('Please enter your name.', authName);
+    if (!EMAIL_PATTERN.test(email)) return fail(authMode === 'login' && !email ? 'Enter your email and password.' : 'Please enter a valid email address.', authEmail);
+    if (authMode === 'signup' && password.length < 8) return fail('Use at least 8 characters for your password.', authPassword);
+    if (authMode === 'login' && !password) return fail('Enter your email and password.', authPassword);
+    authBusy = true;
+    authSubmit.disabled = true;
+    authSubmit.textContent = authMode === 'signup' ? 'Creating account…' : 'Logging in…';
+    const mode = authMode;
+    try {
+      const data = mode === 'signup'
+        ? await api('/api/signup', { method: 'POST', body: { name, email, password, color: collabUser.color, theme: currentTheme } })
+        : await api('/api/login', { method: 'POST', body: { email, password } });
+      completeLogin(data, document.getElementById('authRemember').checked, mode === 'signup');
+    } catch (err) {
+      if (err.status === 409) { setAuthMode('login', err.message); authPassword.focus(); }   // email already has an account
+      else {
+        authSubmit.textContent = AUTH_TEXT[mode].go;
+        fail(err.status ? err.message : connectionNeeded(mode === 'signup' ? 'create an account' : 'log in'), err.status === 401 ? authPassword : null);
+      }
+    } finally {
+      authBusy = false;
+      authSubmit.disabled = false;
+    }
+  });
+
+  // ---------- Settings panel ----------
+  const settingsPanel = document.getElementById('settingsPanel');
+  const setNameInput = document.getElementById('setName');
+  const setSaveBtn = document.getElementById('setSave');
+  let setColor = collabUser.color, settingsReturnFocus = null;
+  function updateSetAvatar() {
+    const avatar = document.getElementById('setAvatar');
+    avatar.textContent = initials(setNameInput.value || collabUser.name);
+    avatar.style.background = setColor;
+  }
+  function openSettings() {
+    settingsReturnFocus = document.activeElement;
+    setColor = collabUser.color;
+    setNameInput.value = collabUser.name;
+    document.getElementById('setError').textContent = '';
+    document.getElementById('setEmail').textContent = collabAuth ? 'Logged in as ' + collabAuth.user.email : 'No account: this name is kept in this browser only.';
+    document.getElementById('setSignOut').textContent = collabAuth ? 'Log out' : 'Sign out';
+    document.getElementById('setThemeNote').textContent = collabAuth
+      ? 'Applies right away and follows your account to your other devices.'
+      : 'Applies right away and is remembered in this browser.';
+    updateSetAvatar();
+    renderColorChoices(document.getElementById('setColors'), setColor, color => { setColor = color; updateSetAvatar(); });
+    renderThemeChoices(document.getElementById('setThemes'), chooseTheme);
+    settingsPanel.hidden = false;
+    setAppInert(true, settingsPanel);
+    setNameInput.focus();
+    setNameInput.select();
+  }
+  function closeSettings() {
+    if (settingsPanel.hidden) return;
+    settingsPanel.hidden = true;
+    setAppInert(false);
+    if (settingsReturnFocus && settingsReturnFocus.focus) settingsReturnFocus.focus();
+  }
+  async function saveSettingsProfile() {
+    const name = cleanName(setNameInput.value);
+    const setError = document.getElementById('setError');
+    if (!name) { setError.textContent = 'Please enter a name.'; setNameInput.focus(); return; }
+    if (name === collabUser.name && setColor === collabUser.color) { closeSettings(); return; }
+    if (!collabAuth) {
+      collabProfile = { name, color: setColor };
+      try { localStorage.setItem('dragonProfile', JSON.stringify(collabProfile)); } catch (e) {}
+      applyProfileLocal(name, setColor);
+      closeSettings();
+      collabToast('Saved. Teammates now see you as ' + name + '.');
+      return;
+    }
+    setSaveBtn.disabled = true;
+    setSaveBtn.textContent = 'Saving…';
+    try {
+      const data = await api('/api/me', { method: 'PATCH', token: collabAuth.token, body: { name, color: setColor } });
+      collabAuth.user = data.user;
+      saveAuth(collabAuth);
+      applyProfileLocal(data.user.name, data.user.color);
+      closeSettings();
+      collabToast('Profile saved. Teammates now see you as ' + data.user.name + '.');
+    } catch (err) {
+      if (err.status === 401) { sessionEnded('Your session has ended. Please log in again.'); return; }
+      setError.textContent = err.status ? err.message : 'Connection required to update your account. Your name and colour have not changed.';
+    } finally {
+      setSaveBtn.disabled = false;
+      setSaveBtn.textContent = 'Save profile';
+    }
+  }
+  setNameInput.addEventListener('input', updateSetAvatar);
+  setNameInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); saveSettingsProfile(); } });
+  document.getElementById('settingsBtn').addEventListener('click', openSettings);
+  document.getElementById('setClose').addEventListener('click', closeSettings);
+  setSaveBtn.addEventListener('click', saveSettingsProfile);
+  settingsPanel.addEventListener('click', e => { if (e.target === settingsPanel) closeSettings(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && !settingsPanel.hidden) closeSettings(); });
+  document.getElementById('setSignOut').addEventListener('click', async () => {
+    const question = collabAuth
+      ? 'Log out of this browser? You will need your email and password to come back. Your project files stay.'
+      : 'Sign out of this browser? The name is forgotten here. Your project files stay.';
+    if (!confirm(question)) return;
+    if (collabAuth) { try { await api('/api/logout', { method: 'POST', token: collabAuth.token, timeout: 3000 }); } catch (e) { /* offline: the session simply expires */ } }
+    clearAuth();
+    try {
+      localStorage.removeItem('dragonProfile');
+      localStorage.removeItem('dragonUser');
+      localStorage.removeItem('dragonIdentity');
+      sessionStorage.removeItem('dragonUser');
+    } catch (e) {}
+    const url = new URL(location.href);
+    url.searchParams.delete('name');
+    location.replace(url.href);
+  });
+
+  renderSettingsButton();
+  if (!collabAuth) {
+    if (collabServerUrl) showAuth(lastEmail() ? 'login' : 'signup');
+    else if (!collabProfile) showAuth('local');
+  }
+
+  // Fit the Explorer (with its ⚙ button), editor and preview inside the window under the
+  // header. The header's height depends on the screen width, so it is measured, not guessed.
+  function updateAppTop() {
+    const ws = document.querySelector('main.workspace');
+    if (!ws) return;
+    document.documentElement.style.setProperty('--app-top', Math.round(ws.getBoundingClientRect().top + window.scrollY) + 'px');
+  }
+  if ('ResizeObserver' in window) {
+    const ro = new ResizeObserver(updateAppTop);
+    for (const el of [document.querySelector('.global-topbar'), document.getElementById('collabBar'), document.getElementById('status')]) if (el) ro.observe(el);
+  }
+  window.addEventListener('resize', updateAppTop);
+  updateAppTop();
+
+  // Deterministic starter project: every browser creates the very same operations under
+  // the reserved client "~seed", so two people opening a new room never get duplicates.
+  function seedOps() {
+    const files = [
+      ['seed-index', 'index.html', BOILERPLATE.replace('  <title>Document</title>', '  <title>My Web Project</title>\n  <link rel="stylesheet" href="style.css">').replace('</body>', '  <script src="script.js"><\/script>\n</body>')],
+      ['seed-style', 'style.css', 'body { font-family: Arial, sans-serif; padding: 24px; color: #1f2937; }\nh1 { color: #2563eb; }\n'],
+      ['seed-script', 'script.js', 'console.log("Multi-file project ready!");\n']
+    ];
+    const ops = [];
+    let s = 0;
+    for (const [fid, name, text] of files) {
+      s++; ops.push({ k: 'set', f: fid, key: 'name', v: name, c: SEED, s, lam: s });
+      ops.push({ k: 'ins', f: fid, o: DragonCRDT.HEAD, x: text, c: SEED, s: s + 1, lam: s + 1 });
+      s += text.length;
+    }
+    return ops;
+  }
+
+  async function startCollaboration() {
+    const rows = await collabStore.load();
+    if (rows.length) {
+      for (const row of rows) if (row.mine) { myOps.push(row.op); noteMine([row.op]); }
+      receiveOps(rows.map(row => row.op), 'idb');
+    }
+    restoreOpenTabs();
+    try { undoMgr.load(JSON.parse(sessionStorage.getItem(UNDO_KEY) || '{}')); } catch (e) {}
+    registerSelf();
+    updateLockButton();
+    if ('serviceWorker' in navigator && (location.protocol === 'http:' || location.protocol === 'https:')) {
+      navigator.serviceWorker.register('sw.js').catch(() => {});
+    }
+    renderPeople();
+    connectServer();
+    bcSend({ t: 'hello', client: collabClient, sv: crdt.sv, state: awarenessState() });
+    updateSyncBadge();
+  }
+
+  // Start with the starter project, then load saved work and connect.
+  crdt.apply(seedOps(), 'seed');
+  rebuildProjectView();
+  openTabs.push('index.html');
+  activePath = 'index.html';
+  loadFileIntoEditor(activePath);
+  fileNameEl.textContent = activePath + ' · ' + languageNameForMode(modeOfPath(activePath));
+  editor.setAttribute('aria-label', languageNameForMode(modeOfPath(activePath)) + ' code editor');
+  editor.setSelectionRange(editor.value.indexOf('<body>') + '<body>\n  '.length, editor.value.indexOf('<body>') + '<body>\n  '.length);
+  renderAllProjectUi();
+  updateEditor();
+  run();
+  startCollaboration();
+})();

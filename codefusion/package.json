@@ -1,0 +1,20 @@
+{
+  "name": "codefusion",
+  "version": "1.0.0",
+  "description": "DRAGON: browser code editor with offline-first multiplayer editing (Code Fuzion 2026, H9)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:terminal": "DRAGON_TERMINAL=1 node server.js",
+    "build": "node build.js",
+    "test": "node test/fuzz.js",
+    "netproxy": "node test/netproxy.js 8790 8787 8791"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "MIT"
+}

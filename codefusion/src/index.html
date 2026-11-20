@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VS Code-Style Multi-Language Code Editor</title>
+<meta name="theme-color" content="#060823">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800"%3E%3Crect width="800" height="800" rx="176" fill="%230B1026"/%3E%3Cpath transform="translate%2864 92%29" fill="%23FE4F17" fill-rule="evenodd" d="M527.5 360.2L527 376.5 567.5 413.8 527.2 451.5 526.8 466 527.8 467.2 554.5 467 606 413.8 554.2 360.8ZM37 2.2L38 9.2 46 35.8 50.8 47.2 59.8 64.2 70.5 80 82.8 94.8 99.2 110.8 112.8 121.5 127.8 131.8 146.5 142.5 182.5 158.5 220.8 170.8 250.5 177.8 287 185 289.5 186.5 272.8 187.2 244 190.2 207 197.2 172.8 207.2 155.8 213.5 130.2 224.5 96.5 242.5 79.8 253.2 63.8 265 34.8 290 16.2 308.5 5.8 320.5 2.5 325.2 22.8 318.8 42.5 314 61.2 310.8 81 308.8 111.8 309 130 310.8 145.2 313.2 144.2 314.8 130.2 323 117.2 332.2 96.5 350 82 364.8 66.5 382.8 45 413 29.8 440.5 20.8 460.8 15.8 474.2 7.8 502.8 4.5 519.5 2.8 535.2 4 535 27 515.8 59.8 494 91.5 477.8 109.5 470.5 131 464 131.5 465.8 128.2 483.5 126.2 504 126 520.2 127.2 542 130.2 564.2 136.2 591 143.5 613.8 160.5 604 188.8 589.8 204.5 583 230 573.8 257.2 566 276.8 561.8 299.5 558 336.2 554.8 367.2 554.8 411 558 438.5 562 464 567 492.2 574 517.5 581.5 501.2 566 472.5 541 433.2 509.5 377 469 299 417 292 409.5 288.8 403.2 287.8 399.8 287.8 393.8 289.8 387.5 294.5 380 301 373.8 310.5 367.8 319.5 364 330.8 361 340 359.8 354.5 359.5 368.2 360.8 387.8 364.8 411.2 372.8 448 388.8 497.8 412.8 482.5 374 463.2 328.8 463.5 327.8 475.2 328 505 330.8 547.5 336.8 601.8 347.8 651.2 360.8 657.5 350.2 663.5 337 667.5 325 669.2 314.8 667.2 299 658.2 265 610.8 241.2 609 242 603 252 601 253 548.2 227.2 544.2 223.8 523.5 196.2 467.2 167 405 132.2 390.5 125 375.8 119 359.2 114 334.5 110 274.8 109 250.5 107 227 103.8 205.8 99.8 181.5 93.8 162.5 87.8 141.8 79.8 109.5 63.5 84.8 47 65.5 31.2ZM406 205.2L407.5 204.8 467.5 232 512.2 251.2 513 252.2 493.2 258 476 260.5 459.5 259.8 448.8 256.5 436.5 249 426.8 239.2 414.8 222.2Z"/%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/png;base64,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">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<p class="files-missing">⚠ <strong>DRAGON’s style and script files did not load.</strong>
+Put <strong>index.html</strong>, <strong>style.css</strong> and <strong>script.js</strong> in the same folder (extract the whole zip first).</p>
+<div class="global-topbar" aria-label="Code editor toolbar">
+<header class="top">
+  <h1 class="brand">
+    <svg class="brand-logo" viewBox="0 0 672 616" role="img" aria-label="DRAGON code editor" focusable="false">
+      <title>DRAGON code editor</title>
+      <path id="dragonLogoPath" fill="#FE4F17" fill-rule="evenodd" d="M527.5 360.2L527 376.5 567.5 413.8 527.2 451.5 526.8 466 527.8 467.2 554.5 467 606 413.8 554.2 360.8ZM37 2.2L38 9.2 46 35.8 50.8 47.2 59.8 64.2 70.5 80 82.8 94.8 99.2 110.8 112.8 121.5 127.8 131.8 146.5 142.5 182.5 158.5 220.8 170.8 250.5 177.8 287 185 289.5 186.5 272.8 187.2 244 190.2 207 197.2 172.8 207.2 155.8 213.5 130.2 224.5 96.5 242.5 79.8 253.2 63.8 265 34.8 290 16.2 308.5 5.8 320.5 2.5 325.2 22.8 318.8 42.5 314 61.2 310.8 81 308.8 111.8 309 130 310.8 145.2 313.2 144.2 314.8 130.2 323 117.2 332.2 96.5 350 82 364.8 66.5 382.8 45 413 29.8 440.5 20.8 460.8 15.8 474.2 7.8 502.8 4.5 519.5 2.8 535.2 4 535 27 515.8 59.8 494 91.5 477.8 109.5 470.5 131 464 131.5 465.8 128.2 483.5 126.2 504 126 520.2 127.2 542 130.2 564.2 136.2 591 143.5 613.8 160.5 604 188.8 589.8 204.5 583 230 573.8 257.2 566 276.8 561.8 299.5 558 336.2 554.8 367.2 554.8 411 558 438.5 562 464 567 492.2 574 517.5 581.5 501.2 566 472.5 541 433.2 509.5 377 469 299 417 292 409.5 288.8 403.2 287.8 399.8 287.8 393.8 289.8 387.5 294.5 380 301 373.8 310.5 367.8 319.5 364 330.8 361 340 359.8 354.5 359.5 368.2 360.8 387.8 364.8 411.2 372.8 448 388.8 497.8 412.8 482.5 374 463.2 328.8 463.5 327.8 475.2 328 505 330.8 547.5 336.8 601.8 347.8 651.2 360.8 657.5 350.2 663.5 337 667.5 325 669.2 314.8 667.2 299 658.2 265 610.8 241.2 609 242 603 252 601 253 548.2 227.2 544.2 223.8 523.5 196.2 467.2 167 405 132.2 390.5 125 375.8 119 359.2 114 334.5 110 274.8 109 250.5 107 227 103.8 205.8 99.8 181.5 93.8 162.5 87.8 141.8 79.8 109.5 63.5 84.8 47 65.5 31.2ZM406 205.2L407.5 204.8 467.5 232 512.2 251.2 513 252.2 493.2 258 476 260.5 459.5 259.8 448.8 256.5 436.5 249 426.8 239.2 414.8 222.2Z"/>
+    </svg>
+  </h1>
+</header>
+
+<nav class="toolbar" aria-label="Editor controls">
+  <div class="tb-group tb-code" role="group" aria-labelledby="tb-code-cap">
+    <span class="tb-cap" id="tb-code-cap">Code</span>
+    <div class="tb-btns">
+      <button id="run" class="green" type="button" title="Run the web preview or check native-language code for common errors">▶ Run / Check Code</button>
+      <button id="debugBtn" type="button" title="Debug the open file on the sync server">🐞 Debug</button>
+      <button id="clear" class="secondary" type="button">Clear Code</button>
+    </div>
+  </div>
+  <div class="tb-group tb-page" role="group" aria-labelledby="tb-page-cap">
+    <span class="tb-cap" id="tb-page-cap">Page</span>
+    <div class="tb-btns">
+      <button id="boiler" class="blue" type="button" title="Insert a basic HTML template (or type ! then Tab)">📄 Boilerplate</button>
+      <button id="addMedia" class="blue" type="button" title="Insert image / video / audio at the cursor (or hold Shift and drag a file into the editor)">🖼 Add Media</button>
+      <button id="print" type="button">Print Preview</button>
+      <button id="download" class="purple" type="button">Download HTML</button>
+      <input id="mediaInput" type="file" accept="image/*,video/*,audio/*" multiple hidden>
+    </div>
+  </div>
+  <div class="tb-group tb-files" role="group" aria-labelledby="tb-files-cap">
+    <span class="tb-cap" id="tb-files-cap">Files</span>
+    <div class="tb-btns">
+      <button id="openFile" class="blue" type="button" title="Open an existing file from your computer (Ctrl+O)">📂 Open File</button>
+      <button id="openFolder" class="blue" type="button" title="Open a whole project folder">📁 Open Folder</button>
+      <button id="addFiles" class="blue" type="button" title="Add multiple files to the project">＋ Add Files</button>
+      <button id="historyBtn" type="button" title="Checkpoints: see what changed and restore a file or the whole project">🕘 History</button>
+      <button id="newFile" type="button" title="Create a new file in any supported language, including .sql and .ts">＋ New File</button>
+      <button id="newFolder" type="button" title="Create a project folder">＋ New Folder</button>
+      <button id="renameFile" class="secondary" type="button" title="Rename the active file">✎ Rename</button>
+      <button id="deleteFile" class="secondary" type="button" title="Delete the active file from this workspace">🗑 Delete</button>
+      <input id="projectFilesInput" type="file" multiple hidden>
+      <input id="projectFolderInput" type="file" webkitdirectory directory multiple hidden>
+    </div>
+  </div>
+  <div class="tb-group tb-save" role="group" aria-labelledby="tb-save-cap">
+    <span class="tb-cap" id="tb-save-cap">Save</span>
+    <div class="tb-btns">
+      <button id="saveProject" class="green" type="button" title="Save every project file to a folder">💾 Save Project</button>
+      <button id="chooseFile" class="blue" type="button" title="Choose a single file for auto-save (Ctrl+S)">💾 Choose Save File</button>
+    </div>
+  </div>
+  <div class="tb-group tb-team" role="group" aria-labelledby="tb-team-cap">
+    <span class="tb-cap" id="tb-team-cap">Team</span>
+    <div class="tb-btns">
+      <button id="shareRoom" type="button" title="Copy a link to this room">🔗 Share link</button>
+      <button id="toggleOffline" type="button" title="Disconnect this tab to test offline editing. Your edits are kept and merged when you go back online.">📴 Go offline</button>
+      <button id="setServer" type="button" title="Set the sync server address">⚙ Server</button>
+      <button id="terminalBtn" type="button" title="Shared terminal on the sync server, in the project folder">⌨ Terminal</button>
+      <button id="authorsBtn" type="button" title="Colour each line number by the teammate who wrote that line">👤 Who wrote this</button>
+      <button id="lockRoom" type="button" title="Protect this room with a password">🔓 Lock room</button>
+    </div>
+  </div>
+</nav>
+</div>
+<div class="collab-bar" id="collabBar" aria-label="Collaboration">
+  <span class="collab-room">Room <b id="collabRoom">main</b></span>
+  <span id="syncBadge" class="sync-badge saved" role="status" aria-live="polite">Saved on this device</span>
+  <span id="connBadge" class="conn-badge connecting" title="Connection to the sync server">Connecting…</span>
+  <span id="runState" class="rt-chip" title="Can the open file run here?">Run: checking…</span>
+  <span id="debugState" class="rt-chip" title="Can the open file be debugged here?">Debug: checking…</span>
+  <span class="collab-people" id="collabPeople"></span>
+  <button id="renameMe" class="me-chip" type="button" title="Change your name">You</button>
+</div>
+<div id="status" class="status" role="status">Ready. Start typing to update the preview.</div>
+<section id="terminalPanel" class="term-panel" hidden aria-label="Shared terminal">
+  <header class="term-head">
+    <strong class="term-title">⌨ Terminal</strong>
+    <div class="term-tabs" id="termTabs" role="tablist" aria-label="Running terminals"></div>
+    <button id="termNew" type="button" title="Start a shared terminal in the project folder">＋ New terminal</button>
+    <span class="term-role" id="termRole"></span>
+    <button id="termAccess" type="button" hidden title="Choose who may type in this terminal">👥 Access</button>
+    <button id="termStop" type="button" title="Send Ctrl+C to the running command">■ Stop</button>
+    <button id="termEnd" type="button" hidden title="End this terminal for everyone">End session</button>
+    <button id="termHide" type="button" title="Hide the terminal panel (it keeps running)">✕</button>
+  </header>
+  <div class="term-access" id="termAccessList" hidden></div>
+  <pre class="term-out" id="termOut"></pre>
+  <p class="term-note" id="termNote" role="status" aria-live="polite"></p>
+  <form class="term-in" id="termForm" autocomplete="off">
+    <span class="term-prompt" aria-hidden="true">›</span>
+    <input id="termInput" type="text" spellcheck="false" autocapitalize="off" aria-label="Terminal input">
+    <button type="submit" id="termSend">Run ⏎</button>
+  </form>
+</section>
+<div id="settingsPanel" class="set-overlay" hidden>
+  <div class="set-dialog" role="dialog" aria-modal="true" aria-labelledby="setTitle">
+    <header class="set-head">
+      <h2 id="setTitle">⚙ Settings</h2>
+      <button id="setClose" type="button" aria-label="Close settings">✕</button>
+    </header>
+    <div class="set-body">
+      <section class="set-section" aria-labelledby="setProfileTitle">
+        <h3 id="setProfileTitle">Profile</h3>
+        <div class="set-profile">
+          <span class="set-avatar" id="setAvatar" aria-hidden="true">?</span>
+          <label class="set-field">Your name<input id="setName" maxlength="24" autocomplete="nickname" spellcheck="false"></label>
+        </div>
+        <p class="set-email" id="setEmail"></p>
+        <div class="set-label" id="setColorLabel">Cursor colour</div>
+        <div class="color-swatches" id="setColors" role="radiogroup" aria-labelledby="setColorLabel"></div>
+        <p class="set-error" id="setError" role="alert"></p>
+        <div class="set-actions">
+          <button id="setSave" type="button" class="set-primary">Save profile</button>
+          <button id="setSignOut" type="button" class="set-ghost">Log out</button>
+        </div>
+        <p class="set-note" id="setProfileNote">Teammates see this name and colour next to your cursor.</p>
+      </section>
+      <section class="set-section" aria-labelledby="setThemeTitle">
+        <h3 id="setThemeTitle">Background theme</h3>
+        <div class="theme-grid" id="setThemes" role="radiogroup" aria-labelledby="setThemeTitle"></div>
+        <p class="set-note" id="setThemeNote">Applies right away.</p>
+      </section>
+    </div>
+  </div>
+</div>
+<div id="authScreen" class="signin" hidden>
+  <form class="signin-card" id="authForm" aria-labelledby="authTitle" novalidate>
+    <svg class="signin-logo" viewBox="0 0 672 616" aria-hidden="true" focusable="false"><use href="#dragonLogoPath"/></svg>
+    <h2 id="authTitle">Create your account</h2>
+    <p class="signin-sub" id="authSub">Sign up once, then log in from any device.</p>
+    <div class="auth-tabs" id="authTabs" role="tablist" aria-label="Account">
+      <button type="button" role="tab" id="authTabSignup" aria-selected="true" aria-controls="authForm">Create account</button>
+      <button type="button" role="tab" id="authTabLogin" aria-selected="false" aria-controls="authForm">Log in</button>
+    </div>
+    <label class="set-field" id="authNameField">Name<input id="authName" maxlength="24" autocomplete="name" spellcheck="false" placeholder="e.g. Suraj Singh"></label>
+    <label class="set-field" id="authEmailField">Email<input id="authEmail" type="email" maxlength="254" autocomplete="email" spellcheck="false" placeholder="you@example.com"></label>
+    <label class="set-field" id="authPasswordField">Password
+      <span class="pw-wrap">
+        <input id="authPassword" type="password" maxlength="200" autocomplete="new-password" placeholder="At least 8 characters">
+        <button type="button" id="authShowPw" class="pw-toggle" aria-label="Show password" aria-pressed="false" title="Show password">👁</button>
+      </span>
+    </label>
+    <label class="auth-remember" id="authRememberRow"><input type="checkbox" id="authRemember" checked> Keep me logged in on this device</label>
+    <p class="set-error" id="authError" role="alert"></p>
+    <button type="submit" class="set-primary signin-go" id="authSubmit">Create account →</button>
+    <p class="set-note" id="authNote">Your password is never stored, only a scrypt hash of it on the DRAGON server.</p>
+  </form>
+</div>
+<div id="toastHost" class="toast-host" aria-live="polite"></div>
+<div id="historyPanel" class="hist-overlay" hidden>
+  <div class="hist-box" role="dialog" aria-modal="true" aria-label="Version history">
+    <div class="hist-head">
+      <div class="hist-title"><b>Version history</b><small>Checkpoints are shared with everyone in the room. Restoring is a normal edit: it syncs to everyone, and Ctrl+Z undoes it.</small></div>
+      <button id="histSave" type="button">＋ Save checkpoint</button>
+      <button id="histClose" type="button" aria-label="Close version history">✕</button>
+    </div>
+    <div class="hist-body">
+      <div id="histList" class="hist-list"></div>
+      <div id="histPreview" class="hist-preview"></div>
+    </div>
+  </div>
+</div>
+<main class="workspace">
+  <section class="panel explorer-panel" id="explorerPanel">
+    <div class="panel-head explorer-head">
+      <button id="toggleExplorer" class="explorer-toggle-btn" type="button" aria-label="Collapse Explorer" aria-expanded="true" title="Collapse Explorer"><span id="explorerToggleIcon" aria-hidden="true">‹</span></button>
+      <span class="explorer-heading">📁 EXPLORER</span>
+      <span class="file" id="projectStats">1 file</span>
+    </div>
+    <span class="explorer-rail-label" aria-hidden="true">FILES</span>
+    <div id="projectTree" class="explorer-root" role="tree" aria-label="Project files"></div>
+    <div class="explorer-foot">
+      <button id="settingsBtn" class="settings-btn" type="button" aria-haspopup="dialog" aria-label="Settings: your profile and background theme" title="Settings: your profile and background theme">
+        <span class="settings-avatar" id="settingsAvatar" aria-hidden="true">?</span>
+        <span class="settings-who" aria-hidden="true"><b id="settingsName">Guest</b><small>Profile &amp; theme</small></span>
+        <span class="settings-gear" aria-hidden="true">⚙</span>
+      </button>
+    </div>
+  </section>
+  <section class="panel editor-panel">
+    <div class="panel-head editor-head">
+      <div class="editor-head-brand">
+        <span class="editor-head-glyph" aria-hidden="true">&lt;/&gt;</span>
+        <span class="editor-head-labels">
+          <span class="editor-head-title">Code Editor</span>
+          <span class="editor-head-kicker">EDITING WORKSPACE</span>
+        </span>
+        <span class="file editor-file-badge" id="fileName">index.html</span>
+      </div>
+      <span class="live" id="saveState">○ Not saved to PC</span>
+    </div>
+    <div id="fileTabs" class="file-tabs" aria-label="Open file tabs"></div>
+    <div id="authorLegend" class="author-legend" hidden></div>
+    <div class="editor-shell">
+      <div id="lines" class="line-numbers" aria-hidden="true">1</div>
+      <div class="code-area">
+        <pre id="highlight" aria-hidden="true"></pre>
+        <textarea id="code" aria-label="HTML code editor" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off"></textarea>
+        <div id="completionPopup" role="listbox" aria-label="Code suggestions"></div>
+      </div>
+    </div>
+  </section>
+  <div id="editorPreviewResizer" class="split-resizer" role="separator" aria-label="Resize code editor and live preview" aria-orientation="vertical" aria-valuemin="25" aria-valuemax="75" aria-valuenow="50" aria-valuetext="Code editor 50%; Live preview 50%" tabindex="0" title="Drag to resize the editor and preview. Use arrow keys; double-click to reset.">
+    <span aria-hidden="true">⋮</span>
+  </div>
+  <section class="panel preview-panel">
+    <div class="panel-head preview-head">
+      <div class="preview-head-brand">
+        <span class="preview-head-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true"><rect x="3" y="4" width="18" height="15" rx="3" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M3.8 8h16.4" stroke="currentColor" stroke-width="1.5"/><circle cx="6.3" cy="6" r=".7" fill="currentColor"/><circle cx="8.8" cy="6" r=".7" fill="currentColor"/><path d="m8 12 2.2 2-2.2 2m4.2 0h3.3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <span class="preview-head-titlegroup">
+          <span class="preview-head-kicker">BROWSER CANVAS</span>
+          <span class="preview-head-title">Live Preview</span>
+        </span>
+      </div>
+      <div class="preview-head-meta">
+        <span class="preview-live-badge"><span class="preview-live-dot" aria-hidden="true"></span> LIVE</span>
+        <span class="file preview-entry-badge" id="previewEntryLabel">Browser output · index.html</span>
+      </div>
+    </div>
+    <iframe id="preview" title="Live webpage preview" sandbox="allow-scripts allow-modals allow-forms allow-downloads"></iframe>
+  </section>
+</main>
+
+<section class="help" aria-label="Syntax colors and editor tips">
+  <div class="help-heading">
+    <span class="help-heading-symbol" aria-hidden="true">&lt;/&gt;</span>
+    <div class="help-heading-copy">
+      <strong>Syntax Colors</strong>
+      <span class="help-subtitle">A quick visual guide to the code editor</span>
+    </div>
+    <span class="help-heading-badge"><span class="help-badge-dot"></span> EDITOR GUIDE</span>
+  </div>
+  <div class="legend" aria-label="Syntax color legend">
+    <span><i class="dot dot-tag"></i><span class="legend-copy"><b>Tags</b><small>HTML elements</small></span></span>
+    <span><i class="dot dot-attr"></i><span class="legend-copy"><b>Attributes</b><small>Element settings</small></span></span>
+    <span><i class="dot dot-value"></i><span class="legend-copy"><b>Values</b><small>Strings and content</small></span></span>
+    <span><i class="dot dot-comment"></i><span class="legend-copy"><b>Comments</b><small>Helpful notes</small></span></span>
+    <span><i class="dot dot-doctype"></i><span class="legend-copy"><b>Doctype</b><small>Document declaration</small></span></span>
+  </div>
+  <div class="help-tip-card">
+    <div class="help-tip-icon" aria-hidden="true">✦</div>
+    <div class="help-tip-content">
+      <div class="help-tip-label">WORKSPACE TIPS</div>
+      <p>Open a whole folder or add multiple files to the Explorer. Keep your HTML, CSS, JavaScript and images together; local CSS/JS references are combined into the live preview. TypeScript and SQL receive language-aware coloring, suggestions, common-error checks, and browser-local execution. Existing Python, Java, C, C++, C#, PHP, Ruby, Swift, Kotlin and Rust workflows are preserved. Use <strong>Save Project</strong> to write the complete workspace to a folder. Inside &lt;script&gt;, try <code>console.l</code>, <code>document.getEle</code>, <code>Math.r</code>, or snippets such as <code>clg</code>, <code>if</code>, <code>forof</code>, <code>trycatch</code>, and <code>addevent</code>. Press ↑/↓ then Enter or Tab to accept a suggestion. The preview is sandboxed.</p>
+    </div>
+  </div>
+</section>
+
+<script src="script.js"></script>
+</body>
+</html>
